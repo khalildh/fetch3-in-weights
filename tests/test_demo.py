@@ -16,10 +16,16 @@ class DemoTests(unittest.TestCase):
         self.assertEqual(text, replay_text)
         self.assertTrue(proof["circuit_matches_spec"])
         self.assertEqual(proof["network_connections"], 0)
+        self.assertTrue(proof['dns_in_weights'])
+        self.assertEqual(proof['receipts'][0]['dns']['token_sha256'],
+                         replay_proof['receipts'][0]['dns']['token_sha256'])
         self.assertEqual(proof["token_sha256"], replay_proof["token_sha256"])
         request = bytes.fromhex(records[0]["request_hex"])
         self.assertTrue(request.startswith(b"GET / HTTP/1.1\r\nHost: example.com\r\n"))
         self.assertTrue(request.endswith(b"Connection: close\r\n\r\n"))
+        records[0]['dns']['proof']['token_sha256']='0'*64
+        with self.assertRaisesRegex(ValueError,'DNS replay token hash differs'):
+            run(replay=records)
 
     def test_replay_rejects_changed_request(self):
         transport = Transport(["https://example.com"], replay=[dict(scheme="https", target="example.com:443",

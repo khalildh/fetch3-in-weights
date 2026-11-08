@@ -1,3 +1,3 @@
-A tiny browser compiled into weights: HTTP requests + HTML parsing through integer ReGLU layers and attention. Real HTTPS, exact replay, no training or LLM API. Python/NumPy reference demo; sockets/TLS stay outside the circuit.
+A browser compiled to weights: DNS queries + answer parsing + IP selection, HTTP requests and HTML parsing. Tested through real HTTPS and exact replay. No training or LLM API. Python/NumPy runner; socket transport/TLS remain outside.
 
 https://github.com/khalildh/fetch3-in-weights

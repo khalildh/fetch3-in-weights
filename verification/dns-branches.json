@@ -1,0 +1,152 @@
+{
+  "dns-tcp": {
+    "live": {
+      "backend": "compiled-dns-circuit/numpy-int64",
+      "host": "example.com",
+      "selected_address": "104.20.23.154",
+      "address_version": 4,
+      "positions": 185,
+      "circuit_matches_spec": true,
+      "independent_resolver_matches": true,
+      "scenario": "tcp-retry",
+      "network_exchanges": 2,
+      "exchanges": [
+        {
+          "transport": "udp",
+          "qtype": 1,
+          "query_sha256": "817625e89f599a7219534881317019717d2058f46f466794e7332cff90b5e22c",
+          "injected_response": "synthetic TC response"
+        },
+        {
+          "transport": "tcp",
+          "qtype": 1,
+          "query_sha256": "094b48bbc12a26fe047501c1f5aa8c902204f05f7220d6b64c6261ef549ffabe",
+          "injected_response": null
+        }
+      ],
+      "token_sha256": "1b3580b8f9def11d162d682d43cce174618524514de3c6e08e65cc3c40531ff3"
+    },
+    "replay": {
+      "backend": "compiled-dns-circuit/numpy-int64",
+      "host": "example.com",
+      "selected_address": "104.20.23.154",
+      "address_version": 4,
+      "positions": 185,
+      "circuit_matches_spec": true,
+      "independent_resolver_matches": true,
+      "scenario": "tcp-retry",
+      "network_exchanges": 0,
+      "exchanges": [
+        {
+          "transport": "udp",
+          "qtype": 1,
+          "query_sha256": "817625e89f599a7219534881317019717d2058f46f466794e7332cff90b5e22c",
+          "injected_response": "synthetic TC response"
+        },
+        {
+          "transport": "tcp",
+          "qtype": 1,
+          "query_sha256": "094b48bbc12a26fe047501c1f5aa8c902204f05f7220d6b64c6261ef549ffabe",
+          "injected_response": null
+        }
+      ],
+      "token_sha256": "1b3580b8f9def11d162d682d43cce174618524514de3c6e08e65cc3c40531ff3"
+    }
+  },
+  "dns-aaaa": {
+    "live": {
+      "backend": "compiled-dns-circuit/numpy-int64",
+      "host": "example.com",
+      "selected_address": "2606:4700:10::ac42:93f3",
+      "address_version": 6,
+      "positions": 238,
+      "circuit_matches_spec": true,
+      "independent_resolver_matches": true,
+      "scenario": "aaaa-fallback",
+      "network_exchanges": 2,
+      "exchanges": [
+        {
+          "transport": "udp",
+          "qtype": 1,
+          "query_sha256": "817625e89f599a7219534881317019717d2058f46f466794e7332cff90b5e22c",
+          "injected_response": "synthetic A NODATA response"
+        },
+        {
+          "transport": "udp",
+          "qtype": 28,
+          "query_sha256": "4d7034351548aa605e6dda719d17a88cf8b5560d99dc76425b872fd60b70d2f0",
+          "injected_response": null
+        }
+      ],
+      "token_sha256": "18bfed6f3221c19077656e95c042a059c22b658e2c3084cdbcecb21965154295"
+    },
+    "replay": {
+      "backend": "compiled-dns-circuit/numpy-int64",
+      "host": "example.com",
+      "selected_address": "2606:4700:10::ac42:93f3",
+      "address_version": 6,
+      "positions": 238,
+      "circuit_matches_spec": true,
+      "independent_resolver_matches": true,
+      "scenario": "aaaa-fallback",
+      "network_exchanges": 0,
+      "exchanges": [
+        {
+          "transport": "udp",
+          "qtype": 1,
+          "query_sha256": "817625e89f599a7219534881317019717d2058f46f466794e7332cff90b5e22c",
+          "injected_response": "synthetic A NODATA response"
+        },
+        {
+          "transport": "udp",
+          "qtype": 28,
+          "query_sha256": "4d7034351548aa605e6dda719d17a88cf8b5560d99dc76425b872fd60b70d2f0",
+          "injected_response": null
+        }
+      ],
+      "token_sha256": "18bfed6f3221c19077656e95c042a059c22b658e2c3084cdbcecb21965154295"
+    }
+  },
+  "dns-cname": {
+    "live": {
+      "backend": "compiled-dns-circuit/numpy-int64",
+      "host": "www.iana.org",
+      "selected_address": "104.18.25.232",
+      "address_version": 4,
+      "positions": 191,
+      "circuit_matches_spec": true,
+      "independent_resolver_matches": true,
+      "scenario": "normal",
+      "network_exchanges": 1,
+      "exchanges": [
+        {
+          "transport": "udp",
+          "qtype": 1,
+          "query_sha256": "74f46d67bef7ae7d9de78ebcea9881627b7da2030c55bdab1f5957bbbf56e9c1",
+          "injected_response": null
+        }
+      ],
+      "token_sha256": "4e199c9df329f2fee11dd474ecf3e66876eec2d6e57d21bb774833d2a413ac60"
+    },
+    "replay": {
+      "backend": "compiled-dns-circuit/numpy-int64",
+      "host": "www.iana.org",
+      "selected_address": "104.18.25.232",
+      "address_version": 4,
+      "positions": 191,
+      "circuit_matches_spec": true,
+      "independent_resolver_matches": true,
+      "scenario": "normal",
+      "network_exchanges": 0,
+      "exchanges": [
+        {
+          "transport": "udp",
+          "qtype": 1,
+          "query_sha256": "74f46d67bef7ae7d9de78ebcea9881627b7da2030c55bdab1f5957bbbf56e9c1",
+          "injected_response": null
+        }
+      ],
+      "token_sha256": "4e199c9df329f2fee11dd474ecf3e66876eec2d6e57d21bb774833d2a413ac60"
+    }
+  }
+}

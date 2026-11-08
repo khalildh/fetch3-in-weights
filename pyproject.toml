@@ -1,6 +1,6 @@
 [project]
 name = "fetch3-in-weights"
-version = "0.1.0"
+version = "0.2.0"
 description = "A text-mode browser compiled into circuit weights, evaluated with exact integer arithmetic"
 requires-python = ">=3.11"
 dependencies = ["numpy>=2.0"]

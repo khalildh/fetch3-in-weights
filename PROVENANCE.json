@@ -2,8 +2,9 @@
   "source_project": "Ternary",
   "source_commit": "c1239eb1ba718107e0ce2f18a911c88937db1024",
   "author": "Khalil Hughes",
-  "extraction": "Fetch3 force circuit and NumPy integer reference; runtime imports adapted for standalone use",
+  "extraction": "Fetch3 and DNS circuits with NumPy integer reference; runtime imports adapted for standalone use",
   "circuit_source_sha256": {
+    "examples/wire/dns_net.tern": "69c69137026d484634917b0ed82aa96dee0639b650b888f45b22c624eb7449cf",
     "examples/wire/fetch3_net.tern": "9a9e62011fe80ddfd17aec01be7f4095f0ed5ab56ebd12506584fe441e8b3f61",
     "examples/wire/toolnet.tern": "06e18c35103c4cee74f1380fb0f14805aaa22b5f7fce0920c439437685ecde41",
     "examples/wire/wire.tern": "ed0460337004851900077cd0f1ff848c450d552083dc03820e0e4c6a70b7825e"
@@ -45,5 +46,31 @@
     "raw web logs",
     "credentials",
     "GPU implementation"
-  ]
+  ],
+  "dns_circuit_artifacts": {
+    "allow.txt": "b7fa3061d28237a56192d486392e4ea376c2b95a56ef9c75df6b37f45d7acc20",
+    "const_v.npy": "f8c18558026cdf685d1393937cadf128e67a7aeb2cfe4e5c0d42d70d4199be8d",
+    "const_w.npy": "dca25f0fde1b1bae2073fd2c1b4c1030f1b42aa8a3eb0b6b10ee9922ac21ae4c",
+    "feat.txt": "8c73e848455d113d2f968b8a02e34cd65d67f22e31c03ab993b3cc016c1e60d1",
+    "feat_w.npy": "700abd6e58d82c97489685b56800d86b830a1f1640490ec9c1716a141054c701",
+    "head_d.npy": "3a61fb8fa0e9a3e7721230f214316d1fb73621a77fbe7c0a1bdb805130103602",
+    "head_k.npy": "4692c05f331bd900124aeff8e57d4741ffcc21a622bd79e4de73c496435995ed",
+    "head_o.npy": "d8674e7a128c4b52d4a0683dba6885e9ca241b6d3517a9b1e15a3db0254ccbed",
+    "head_q.npy": "3de5e5c1765490e592613e46df3decbea6facb921c4f7cffa89ba122426f024b",
+    "head_t.npy": "7fb5c4f5702df439fd532ae356f485546a612c4a0cc059841292153cea961cd3",
+    "head_v.npy": "960ef09d920e4fb168170bb370f0ac3e05ccd07200e575e5e5a6e166384504fe",
+    "heads.txt": "5ea41004f679efd4757eb7b52d0e5f3cc5943ff0b8223a60259d7f0d547d845b",
+    "layout.json": "1b766288d9993cc77027a7f679d80ad0e841786d1f616b117165fabc82e55f66",
+    "meta.npy": "da7da2ec7084137b987d6a10fd298f34aad934fd64c4a146a4adbb7dc2178547",
+    "names.txt": "ffd735c5706e36a5add999a5bf3d4c6863f8420f82c7f111befd4f0674452145",
+    "names_w.npy": "a0e90a56e1b572c8a674802524153d9d1e5d76394a741b4d1b7ea83fc57c8013",
+    "op_d.npy": "36387b2db3945e6355db7d1b815cdea7d9f01a70b2ad699dc2974e500e916724",
+    "op_g.npy": "3bf5ac5f1f6b5f24ebe6ab4617f52f37a47cd528cfc2faa2d613fb70d188b9e5",
+    "op_l.npy": "8eb18d802e2ee55092ab60459f5fe629b356218ea1a199785dac50be90abf475",
+    "op_w.npy": "cf54a358a4660f148947df6257fe49580a924fb890a45a62448623754dcb66d9",
+    "out_w.npy": "6775e692fe11c5143ff559fabf8bbb65a60ccbda64a58f7d826dfba405d6ee7e",
+    "posf.txt": "7f9e03127c7b42ace8ffe5f064c6de4a2a68c1fd6edd4d3454c79c24bc06d711",
+    "posf_w.npy": "97b197f621b1497dfba8d572245d4554bfa8fc94ff7dff30f2348bd4c2d6360d",
+    "tool.txt": "a4d83335f568348754b1e07969c30f093994caeea6e9a1f8ee8954080cf3593a"
+  }
 }
