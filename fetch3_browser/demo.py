@@ -11,6 +11,7 @@ from pathlib import Path
 
 from . import fetch2 as F2
 from . import fetch3 as F3
+from .dns_runtime import Resolver
 
 WEIGHTS = Path(__file__).parent / "weights"
 FIXTURE = (b"<!doctype html><html><head><title>Fetch3</title>"
@@ -50,11 +51,13 @@ def request_block(lay, toks):
 
 
 class Transport:
-    def __init__(self, allow, live=False, replay=None, timeout=15.0, max_bytes=8192):
+    def __init__(self, allow, live=False, replay=None, timeout=15.0, max_bytes=8192,
+                 resolver=None, dns_scenario="normal"):
         self.allow, self.live, self.timeout, self.max_bytes = allow, live, timeout, max_bytes
         self.replay = list(replay) if replay is not None else None
         self.receipts, self.records = [], []
         self.connections = 0
+        self.resolver, self.dns_scenario = resolver, dns_scenario
 
     def exchange(self, scheme, target, request):
         host, sep, port_text = target.rpartition(":")
@@ -65,12 +68,26 @@ class Transport:
         if origin not in self.allow and f"{scheme}://{target}" not in self.allow:
             raise ValueError("target outside the circuit's compiled allowlist")
         digest = hashlib.sha256(request).hexdigest()
+        saved = None
         if self.replay is not None:
             if not self.replay:
                 raise ValueError("replay exhausted")
             saved = self.replay.pop(0)
             if (saved["scheme"], saved["target"], saved["request_hex"]) != (scheme, target, request.hex()):
                 raise ValueError("replay request differs from recorded circuit output")
+            if "dns" not in saved:
+                raise ValueError("recording predates compiled DNS; make a new recording with this version")
+        dns = Resolver(live=self.live, resolver=self.resolver, scenario=self.dns_scenario,
+                       replay=list(saved["dns"]["exchanges"]) if saved is not None else None)
+        dns_proof, dns_records = dns.resolve(origin)
+        selected = ipaddress.ip_address(dns_proof["selected_address"])
+        if not selected.is_global or selected.is_multicast:
+            raise ValueError("refusing a non-public circuit-selected address")
+        if saved is not None:
+            if dns_proof["selected_address"] != saved["dns"]["proof"]["selected_address"]:
+                raise ValueError("DNS replay selected a different address")
+            if dns_proof['token_sha256'] != saved['dns']['proof']['token_sha256']:
+                raise ValueError('DNS replay token hash differs from recording')
             response, term = bytes.fromhex(saved["response_hex"]), saved["term"]
             receipt = dict(mode="replay", target=target, request_sha256=digest, response_bytes=len(response),
                            network_connections=0)
@@ -80,19 +97,18 @@ class Transport:
                            network_connections=0)
         else:
             deadline = time.monotonic() + self.timeout
-            infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-            if not infos:
-                raise ValueError("DNS returned no addresses")
-            for info in infos:
-                addr = ipaddress.ip_address(info[4][0].split("%")[0])
-                if not addr.is_global or addr.is_multicast:
-                    raise ValueError("refusing a non-public destination")
-            family, socktype, proto, _, sockaddr = infos[0]
-            sock = socket.socket(family, socktype, proto)
+            # No host-name resolver here. Connect to the numeric circuit output,
+            # while SNI and certificate verification still use the original host.
+            family = socket.AF_INET6 if selected.version == 6 else socket.AF_INET
+            sockaddr = (str(selected), port)
+            sock = socket.socket(family, socket.SOCK_STREAM)
             try:
                 sock.settimeout(max(0.1, deadline - time.monotonic()))
                 sock.connect(sockaddr)
                 self.connections += 1
+                peer_address = str(ipaddress.ip_address(sock.getpeername()[0]))
+                if ipaddress.ip_address(peer_address) != selected:
+                    raise ValueError("connected peer differs from the circuit-selected address")
                 if scheme == "https":
                     sock = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
                 tls_version = sock.version() if scheme == "https" else None
@@ -119,10 +135,13 @@ class Transport:
                 sock.close()
             receipt = dict(mode="live", target=target, request_sha256=digest, sent_bytes=len(request),
                            response_bytes=len(response), network_connections=1, tls=tls_version,
-                           certificate_verified=scheme == "https", sent_exact_circuit_bytes=True)
+                           certificate_verified=scheme == "https", sent_exact_circuit_bytes=True,
+                           connected_address=str(selected),peer_address=peer_address,tls_server_hostname=host)
+        receipt.update(dns=dns_proof,runtime_target_getaddrinfo_used=False)
         self.receipts.append(receipt)
         self.records.append(dict(scheme=scheme, target=target, request_hex=request.hex(),
-                                 response_hex=response.hex(), term=int(term)))
+                                 response_hex=response.hex(), term=int(term),
+                                 dns=dict(proof=dns_proof,exchanges=dns_records)))
         return response, int(term)
 
 
@@ -179,9 +198,10 @@ class Session:
             count += 1
 
 
-def run(url="https://example.com", live=False, replay=None, pages=4, follow=None):
+def run(url="https://example.com", live=False, replay=None, pages=4, follow=None,
+        resolver=None,dns_scenario="normal"):
     net, lay, page = load_model()
-    transport = Transport(net.allow, live=live, replay=replay)
+    transport = Transport(net.allow, live=live, replay=replay,resolver=resolver,dns_scenario=dns_scenario)
     session = Session(net, lay, page, transport)
     started = time.monotonic()
     text = session.read(url, max_pages=pages, follow=follow)
@@ -191,6 +211,8 @@ def run(url="https://example.com", live=False, replay=None, pages=4, follow=None
                  positions=len(session.tokens), circuit_matches_spec=True,
                  ending=lay.name(session.tokens[-1]),
                  network_connections=transport.connections, seconds=round(time.monotonic()-started, 2),
+                 dns_in_weights=True,
+                 dns_network_exchanges=sum(r['dns']['network_exchanges'] for r in transport.receipts),
                  wires=net.n, operations=len(net.op_w), attention_heads=len(net.heads), levels=net.depth,
                  receipts=transport.receipts,
                  token_sha256=hashlib.sha256(json.dumps(session.tokens,separators=(",", ":")).encode()).hexdigest())
@@ -206,15 +228,19 @@ def main():
     parser.add_argument("--record", type=Path, help="save raw response bytes for replay; keep this file private")
     parser.add_argument("--pages", type=int, default=4, choices=range(1, 25))
     parser.add_argument("--follow", type=int, help="follow a circuit-numbered link, 1..32")
+    parser.add_argument("--resolver", help="numeric DNS resolver IP (default: /etc/resolv.conf)")
     args = parser.parse_args()
     replay = json.loads(args.replay.read_text()) if args.replay else None
     if replay and replay["url"] != args.url:
         parser.error("--url must match the recorded URL")
     try:
-        text, proof, records = run(args.url, args.live, replay["exchanges"] if replay else None, args.pages, args.follow)
+        text, proof, records = run(args.url, args.live, replay["exchanges"] if replay else None,
+                                   args.pages, args.follow,resolver=args.resolver)
     except (OSError, ValueError, AssertionError) as error:
         parser.exit(1, f"fetch3: {error}\n")
     print("Fetch3: browser logic compiled into circuit weights\nRunner: Python / NumPy, exact integer reference\n")
+    if replay and proof['token_sha256'] != replay['proof']['token_sha256']:
+        parser.exit(1,'fetch3: replay token hash differs from recording\n')
     print(text.strip())
     print("\nExecution proof:\n" + json.dumps(proof, indent=2))
     if args.record:

@@ -1,0 +1,877 @@
+# DNS in the net (docs/tfs_dns.md): fetch's name resolution compiled into exact ternary-weight layers beside the
+# integer hybrid. At an allowed call's <|fetch_end|> (v1's rule and allowlist, as fetch v2's verdict) this net
+#   1. forces the DNS query, every byte a byte token <|x_HH|>: ID (the position of <|d_q4|>), RD, QDCOUNT 1, the host
+#      of the checked URL split into labels, QTYPE A (then AAAA), QCLASS IN; then <|d_send|> (the runtime sends it
+#      over UDP and pages the answer datagram back as a tape: position d + 1 + i reads byte i, d the <|d_send|>);
+#   2. parses the answer as it copies it, one state token per byte: header (ID, QR, opcode, TC, RCODE, QDCOUNT,
+#      ANCOUNT <= 32), the question (byte for byte the query's), ANCOUNT records: owner names (labels, compression
+#      pointers), TYPE / CLASS / TTL / RDLENGTH, A / AAAA addresses, CNAME targets (at most 4), other RDATA skipped;
+#      names compared by their labels, case-insensitively (runs in place, at most 4 pointers, strictly backward);
+#      a truncated UDP answer: the same query again over TCP (<|d_t4|> / <|d_t6|>); with fetch v2 merged, a
+#      redirect's connect line resolved too;
+#   3. chooses the address: the first public A (AAAA) of the query's name after its CNAMEs, none if any address
+#      record of the answer is not public (the ranges below, compared on the bytes), and forces <|d_ip4|> /
+#      <|d_ip6|>, the address bytes, <|d_go|> and the call again (<|fetch|> URL <|fetch_end|>) for fetch v2 / v3,
+#      which then build the request; at its own copy's <|fetch_end|> this net is silent. Failures: a reason token,
+#      then <|fetch_fail|>.
+# The spec is tfs/dns.py (Spec); tfs/dns_rt.py is the runtime (UDP to the configured resolver, the connect to the
+# chosen address).
+#
+#     uv run python -m tern examples/wire/dns_net.tern LO FETCH_LO V ALLOW [FETCH2_LO [OUT_DIR]]   (FETCH2_LO -1: none)
+#
+# LO: the first of the S = 337 DNS ids (256 byte tokens, 13 markers, 68 states); FETCH_LO: v1's block; V: the merged
+# vocabulary; ALLOW: comma-separated origins or "-" (their hosts must be names).
+#
+# Silence (proved below when the file loads): every case bit is an AND over 0/1 bits with a phase bit among its
+# positive inputs (the token is <|fetch_end|>; the latest DNS marker is a query, a send, an address, <|d_go|>; the
+# token is a reason), and every phase bit is 0 outside a DNS block: there the output code and fire are exactly 0.
+import wire
+import toolnet
+from wire import w_lin, w_reglu
+from toolnet import tok_feat, pos_feat, latest, abs_head, kr, eqb, geb, leb, andb, gate_by, onehot
+
+let S = 337
+let NBYTE = 256
+let UMAX = 64
+let OMAX = 48
+let VB = 16384
+let W0 = -16                     # the tape's window: offsets W0 .. W1
+let W1 = 0
+let RMAX = 32
+let CMAX = 4
+let HOPS = 4
+let CHARS = "abcdefghijklmnopqrstuvwxyz0123456789.-_~/:?=&%"
+# with fetch v2 merged (FLO2 >= 0): v2's URL characters (tfs/fetch2.py URLCH: upper case and '#' are v2 TEXT tokens)
+# and v2's verdict (the fragment from the first '#' never checked), so this net answers exactly the calls v2 sends
+let UCH2 = "abcdefghijklmnopqrstuvwxyz0123456789.-_~/:?=&%ABCDEFGHIJKLMNOPQRSTUVWXYZ#"
+let NEXTRA2 = 52                  # v2's <|b_XX|> tokens; its markers follow: h_tcp, h_tls, h_req, ...
+
+# v2's <|b_XX|> index of a TEXT byte that is not a v1 URL character (tfs/fetch2.py EXTRA)
+fn extra_index(b: int) -> int {
+    let k = 0
+    for v in [9, 10, 13] {
+        if v == b { return k }
+        k = k + 1
+    }
+    for v in 32..127 {
+        let isc = false
+        for ch in CHARS {
+            if ch == v { isc = true }
+        }
+        if isc == false {
+            if v == b { return k }
+            k = k + 1
+        }
+    }
+    panic(format("dns_net: no v2 TEXT token for byte {}", b))
+    return -1
+}
+let MARKS = ["q4", "q6", "send", "ip4", "ip6", "go", "nx", "priv", "bad", "none", "tc", "t4", "t6"]
+
+fn states() -> list[str] {
+    let out = ["hdr", "hend", "ql", "qc", "qz", "qt", "nl0", "nl", "nc", "nz0", "nz", "np0", "np", "nq",
+        "cl0", "cl", "cc", "cp0", "cp", "cq", "cz"]
+    for k in 1..RMAX + 1 { push(out, format("rr{}", k)) }
+    for n in ["f", "ra", "r6"] { push(out, n) }
+    for k in 1..CMAX + 1 { push(out, format("rc{}", k)) }
+    for n in ["rx", "a", "ap", "aq", "av", "x", "ru", "au"] { push(out, n) }
+    return out
+}
+
+fn sidx(l: list[str], n: str) -> int {
+    for i in 0..len(l) {
+        if l[i] == n { return i }
+    }
+    panic(format("dns_net: no state {}", n))
+    return -1
+}
+
+fn wnames() -> list[str] {
+    let out: list[str] = []
+    for i in 0..W1 - W0 + 1 { push(out, format("W{}", i)) }
+    return out
+}
+
+fn flags() -> list[str] {
+    let out = ["F_FETCH", "F_END", "ISUC", "UCI", "UCB", "XB", "MARK", "MK", "F_GO", "F_SEND", "F_Q", "Q6", "ST",
+        "ISST", "LK", "PK", "NST", "CEND", "RR", "RRI", "RC", "RCI", "RD", "RD6", "RDA", "F_AP", "F_AV", "F_HEND",
+        "F_QZ", "TAPE", "NT", "ZK", "OB", "TCPQ", "F_SCH", "F_TLS", "F_REQ", "F_RDR"]
+    for n in wnames() { push(out, n) }
+    return out
+}
+
+fn cidx(s: str, ch: int) -> int {
+    for i in 0..len(s) {
+        if s[i] == ch { return i }
+    }
+    return -1
+}
+
+type Ctx = { g: toolnet.G, c: wire.Circuit, memo: map[str, int] }
+
+fn eqm(x: Ctx, w: int, v: int) -> int {
+    let key = format("{}:{}", w, v)
+    match map_get(x.memo, key) {
+        Some(r) => { return r }
+        None => {}
+    }
+    let r = eqb(x.c, w, v)
+    map_set(x.memo, key, r)
+    return r
+}
+
+fn ge_w(c: wire.Circuit, a: int, b: int) -> int { return geb(c, w_lin(c, [(a, 1), (b, -1)], 0), 0) }
+fn gt_w(c: wire.Circuit, a: int, b: int) -> int { return geb(c, w_lin(c, [(a, 1), (b, -1)], 0), 1) }
+fn eq_w(c: wire.Circuit, a: int, b: int) -> int { return eqb(c, w_lin(c, [(a, 1), (b, -1)], 0), 0) }
+fn or2(c: wire.Circuit, a: int, b: int) -> int { return geb(c, w_lin(c, [(a, 1), (b, 1)], 0), 1) }
+fn orn(c: wire.Circuit, ws: list[int]) -> int {
+    let ts: list[(int, int)] = []
+    for w in ws { push(ts, (w, 1)) }
+    return geb(c, w_lin(c, ts, 0), 1)
+}
+fn sumw(c: wire.Circuit, ws: list[int]) -> int {
+    let ts: list[(int, int)] = []
+    for w in ws { push(ts, (w, 1)) }
+    return w_lin(c, ts, 0)
+}
+fn notb(c: wire.Circuit, a: int) -> int { return w_lin(c, [(a, -1)], 1) }
+fn inr(c: wire.Circuit, x: int, lo: int, hi: int) -> int { return andb(c, [geb(c, x, lo), leb(c, x, hi)], []) }
+fn plus(c: wire.Circuit, a: int, k: int) -> int { return w_lin(c, [(a, 1)], k) }
+fn diff(c: wire.Circuit, a: int, b: int) -> int { return w_lin(c, [(a, 1), (b, -1)], 0) }
+
+# a name byte as DNS compares it: x + 32 for an ASCII upper-case letter
+fn fold(c: wire.Circuit, x: int) -> int { return w_lin(c, [(x, 1), (inr(c, x, 65, 90), 32)], 0) }
+
+# the one-hot base-64 digits of 0 <= x < 4096 (128 bits; all 0 for x outside)
+fn hot64(c: wire.Circuit, x: int) -> list[int] {
+    let hs: list[(int, int)] = []
+    for m in 1..64 { push(hs, (geb(c, x, 64 * m), 1)) }
+    let hi = w_lin(c, hs, 0)
+    let lo = w_lin(c, [(x, 1), (hi, -64)], 0)
+    return concat(onehot(c, hi, 64), onehot(c, lo, 64))
+}
+
+# The latest position whose key one-hot (khot, two digits) equals the query's (qhot) and whose `kflag` is 1: WM per
+# digit equal and for the flag (2 WM + WM beats every other key by >= WM > the recency range), recency RG, BOS last.
+let WM = 68719476736              # 2^36
+fn match_head(g: toolnet.G, nm: str, qhot: list[int], khot: list[int], kflag: int, v: list[int]) -> list[int] {
+    let q: list[list[(int, int)]] = []
+    let k: list[list[(int, int)]] = []
+    for j in 0..len(qhot) {
+        push(q, [(qhot[j], WM)])
+        push(k, [(khot[j], 1)])
+    }
+    push(q, [(toolnet.one(), WM)])
+    push(k, [(kflag, 1)])
+    push(q, [(toolnet.one(), toolnet.RG)])
+    push(k, [(pos_feat(g, "pos"), 1)])
+    push(q, [(toolnet.one(), toolnet.MBOS)])
+    push(k, [(pos_feat(g, "bos"), 1)])
+    return toolnet.head(g, nm, q, k, v, [])
+}
+
+fn lt_w(c: wire.Circuit, a: int, b: int) -> int { return gt_w(c, b, a) }
+
+# the offset of byte j of a name with runs starting at st[k] and ending (as indices) before cum[k]
+fn map_pos(c: wire.Circuit, st: list[int], cum: list[int], j: int) -> int {
+    let ts: list[(int, int)] = []
+    for k in 0..len(st) {
+        let inr_k = lt_w(c, j, cum[k])
+        let rel = w_lin(c, [(st[k], 1), (j, 1)], 0)
+        if k > 0 {
+            inr_k = andb(c, [ge_w(c, j, cum[k - 1]), inr_k], [])
+            rel = w_lin(c, [(st[k], 1), (j, 1), (cum[k - 1], -1)], 0)
+        }
+        push(ts, (gate_by(c, rel, andb(c, [inr_k, geb(c, j, 0)], [])), 1))
+    }
+    return w_lin(c, ts, 0)
+}
+
+
+# base-32 digits of 0 <= x < 32768 and the sum of their squares (terms); fetch_net.tern's
+fn digits(c: wire.Circuit, x: int) -> (int, int, int, list[(int, int)]) {
+    let au: list[(int, int)] = []
+    let rs: list[(int, int)] = [(x, 1)]
+    for m in 1..32 {
+        push(au, (kr(c, 1, [(x, 1)], 1 - 1024 * m), 1))
+        push(au, (kr(c, 1, [(x, 1)], -1024 * m), -1))
+        push(rs, (kr(c, 1024, [(x, 1)], 1 - 1024 * m), -1))
+        push(rs, (kr(c, 1024, [(x, 1)], -1024 * m), 1))
+    }
+    let a = w_lin(c, au, 0)
+    let r = w_lin(c, rs, 0)
+    let bu: list[(int, int)] = []
+    let cs: list[(int, int)] = [(r, 1)]
+    for m in 1..32 {
+        push(bu, (kr(c, 1, [(r, 1)], 1 - 32 * m), 1))
+        push(bu, (kr(c, 1, [(r, 1)], -32 * m), -1))
+        push(cs, (kr(c, 32, [(r, 1)], 1 - 32 * m), -1))
+        push(cs, (kr(c, 32, [(r, 1)], -32 * m), 1))
+    }
+    let b = w_lin(c, bu, 0)
+    let cc = w_lin(c, cs, 0)
+    let sq: list[(int, int)] = []
+    for d in [a, b, cc] { push(sq, (w_reglu(c, [(d, 1)], 0, [(d, 1)], 0), 1)) }
+    return (a, b, cc, sq)
+}
+
+# an abs head at the position held by wire `at`
+fn read_at(g: toolnet.G, nm: str, at: int, v: list[int]) -> list[int] {
+    let (a, b, cc, sq) = digits(g.c, at)
+    return abs_head(g, nm, a, b, cc, sq, v)
+}
+
+# floor(x / 256) for 0 <= x < 16384, and x mod 256
+fn div256(c: wire.Circuit, x: int) -> (int, int) {
+    let hs: list[(int, int)] = []
+    for m in 1..64 { push(hs, (geb(c, x, 256 * m), 1)) }
+    let hi = w_lin(c, hs, 0)
+    return (hi, w_lin(c, [(x, 1), (hi, -256)], 0))
+}
+
+# x mod 16 for 0 <= x <= 255
+fn mod16(c: wire.Circuit, x: int) -> int {
+    let ts: list[(int, int)] = [(x, 1)]
+    for m in 1..16 { push(ts, (geb(c, x, 16 * m), -16)) }
+    return w_lin(c, ts, 0)
+}
+
+fn check_origin(o: str) {
+    assert(len(o) <= OMAX, "dns_net: an origin longer than OMAX")
+    assert(starts_with(o, "https://") | starts_with(o, "http://"), "dns_net: an origin is not http(s)://")
+    for ch in o { assert(cidx(CHARS, ch) >= 0, "dns_net: an origin character outside CHARS") }
+}
+
+# addr in the prefix (bytes pre, n bits): the full bytes equal, the partial one in its range
+fn in_prefix(x: Ctx, addr: list[int], pre: list[int], n: int) -> int {
+    let c = x.c
+    let bits: list[int] = []
+    let full = 0
+    while 8 * (full + 1) <= n {
+        push(bits, eqm(x, addr[full], pre[full]))
+        full = full + 1
+    }
+    let rem = n - 8 * full
+    if rem > 0 {
+        let span = 1
+        for _ in 0..8 - rem { span = span * 2 }
+        let lo = pre[full]
+        push(bits, inr(c, addr[full], lo, lo + span - 1))
+    }
+    return andb(c, bits, [])
+}
+
+# the address tables (tfs/dns.py V4_REFUSE, V6_ALLOW, V6_REFUSE): 1 iff public
+fn public4(x: Ctx, a: list[int]) -> int {
+    let c = x.c
+    let rs = [in_prefix(x, a, [0], 8), in_prefix(x, a, [10], 8), in_prefix(x, a, [100, 64], 10),
+        in_prefix(x, a, [127], 8), in_prefix(x, a, [169, 254], 16), in_prefix(x, a, [172, 16], 12),
+        in_prefix(x, a, [192, 0, 0], 24), in_prefix(x, a, [192, 0, 2], 24), in_prefix(x, a, [192, 168], 16),
+        in_prefix(x, a, [198, 18], 15), in_prefix(x, a, [198, 51, 100], 24), in_prefix(x, a, [203, 0, 113], 24),
+        in_prefix(x, a, [224], 3)]
+    return andb(c, [], rs)
+}
+
+fn public6(x: Ctx, a: list[int]) -> int {
+    let c = x.c
+    let g = in_prefix(x, a, [32], 3)
+    let rs = [in_prefix(x, a, [32, 1, 0], 23), in_prefix(x, a, [32, 1, 13, 184], 32), in_prefix(x, a, [32, 2], 16),
+        in_prefix(x, a, [63, 255, 0], 20)]
+    return andb(c, [g], rs)
+}
+
+fn sb(x: Ctx, stf: int, st: list[str], n: str) -> int { return eqm(x, stf, sidx(st, n) + 1) }
+fn W(win: list[int], k: int) -> int { return win[k - W0] }
+fn sid(SLO: int, st: list[str], n: str) -> int { return SLO + sidx(st, n) }
+
+type Out = { ot: list[list[(int, int)]], fire: list[(int, int)], named: list[(str, int)] }
+
+fn force(o: Out, bit: int, id: int) {
+    toolnet.emit(o.ot, bit, id)
+    push(o.fire, (bit, 1))
+}
+
+# fetch v2's connect line for an origin (tfs/fetch2.py connect_line): HOST[:PORT], the default port written out
+fn connect_line(org: str) -> str {
+    let s0 = 7
+    if starts_with(org, "https://") { s0 = 8 }
+    let auth = substr(org, s0, len(org))
+    if find(auth, ":") >= 0 { return auth }
+    if s0 == 8 { return auth + ":443" }
+    return auth + ":80"
+}
+
+fn build(lo: int, flo: int, V: int, allow: list[str], flo2: int) -> toolnet.Built {
+    let UCH = CHARS
+    if flo2 >= 0 { UCH = UCH2 }
+    let nb = toolnet.bitlen_of(V - 1)
+    let st = states()
+    let offs: list[int] = [-1]
+    for i in 1..UMAX + 1 { push(offs, i) }
+    let g = toolnet.new_graph(nb, flags(), offs)
+    let c = g.c
+    let x = Ctx { g: g, c: c, memo: map_new() }
+    let pos = pos_feat(g, "pos")
+    let stf = tok_feat(g, "ST")
+    let isst = tok_feat(g, "ISST")
+    let cur_end = tok_feat(g, "F_END")
+    let cur_send = tok_feat(g, "F_SEND")
+    let MLO = lo + NBYTE                               # the markers
+    let SLO = lo + NBYTE + len(MARKS)                  # the states
+    let FETCH = flo
+    let FEND = flo + 1
+    let FFAIL = flo + 52
+    let ot: list[list[(int, int)]] = []
+    for b in 0..nb { push(ot, []) }
+    let o = Out { ot: ot, fire: [], named: [] }
+
+    # ---- level 1: the latest markers, the call, the tokens behind
+    let lm = latest(g, "last_mark", tok_feat(g, "MARK"), [tok_feat(g, "MK"), pos])
+    let mk = lm[0]
+    let mpos = lm[1]
+    let d = latest(g, "last_send", cur_send, [pos])[0]
+    let lq = latest(g, "last_q", tok_feat(g, "F_Q"), [pos, tok_feat(g, "Q6"), tok_feat(g, "TCPQ")])
+    let q0 = lq[0]
+    let isq6 = lq[1]
+    let istcp = lq[2]
+    let (pa, pb, pc, pss) = toolnet.off_digits(g, -1)
+    let prv = abs_head(g, "prev_go", pa, pb, pc, [(pss, 1)], [tok_feat(g, "F_GO"), tok_feat(g, "F_RDR")])
+    let pgo = prv[0]
+    # a source: the model's call (<|fetch|> not after <|d_go|>), or, with fetch v2 merged, a redirect's connect line
+    # (fetch's scheme marker right after <|h_redirN|>: <|h_tls|> HOST:PORT <|h_req|>); this net's copies are neither
+    let fsch = tok_feat(g, "F_SCH")
+    let anyf = latest(g, "last_fetch", w_lin(c, [(tok_feat(g, "F_FETCH"), 1), (fsch, 1)], 0), [pos])[0]
+    let uv: list[int] = [pos, fsch, tok_feat(g, "F_TLS")]
+    for i in 1..UMAX + 1 {
+        let (a, b, cc, ss) = toolnet.off_digits(g, i)
+        for w in [a, b, cc, ss] { push(uv, w) }
+    }
+    let rsrc = andb(c, [fsch, prv[1]], [])
+    let lus0 = latest(g, "last_src", w_lin(c, [(andb(c, [tok_feat(g, "F_FETCH")], [pgo]), 1), (rsrc, 1)], 0), uv)
+    let us = lus0[0]
+    let is_rdr = lus0[1]                                # the source is a redirect's connect line
+    let is_tls = lus0[2]
+    let lus: list[int] = [us]
+    for k in 3..len(lus0) { push(lus, lus0[k]) }
+    let sv: list[int] = []
+    let sc: list[int] = []
+    let sci: list[int] = []
+    for j in 0..UMAX {
+        let r = abs_head(g, format("u{}", j), lus[1 + 4 * j], lus[2 + 4 * j], lus[3 + 4 * j], [(lus[4 + 4 * j], 1)],
+            [tok_feat(g, "UCB"), tok_feat(g, "ISUC"), tok_feat(g, "UCI")])
+        push(sv, r[0])
+        push(sc, r[1])
+        push(sci, r[2])
+    }
+
+    # phases (exact: the latest-marker head reads a token feature)
+    let ph_q = w_lin(c, [(eqm(x, mk, 1), 1), (eqm(x, mk, 2), 1), (eqm(x, mk, 12), 1), (eqm(x, mk, 13), 1)], 0)
+    let ph_ans = eqm(x, mk, 3)
+    let ph_ip = w_lin(c, [(eqm(x, mk, 4), 1), (eqm(x, mk, 5), 1)], 0)
+    let is_ip6 = eqm(x, mk, 5)
+    let ph_go = eqm(x, mk, 6)
+    # a reason ends the fetch (<|fetch_fail|> next), but <|d_tc|> after a UDP answer: the same query over TCP next
+    let at_mark = eqm(x, diff(c, pos, mpos), 0)
+    let reason: list[(int, int)] = []
+    for k in 7..11 { push(reason, (eqm(x, mk, k), 1)) }
+    let is_tc = eqm(x, mk, 11)
+    push(reason, (andb(c, [is_tc, istcp], []), 1))
+    let cur_reason = andb(c, [w_lin(c, reason, 0), at_mark], [])
+    let cur_retry = andb(c, [is_tc, at_mark], [istcp])
+
+    # ---- the call: its length, its checks, the allowlist (fetch v2's verdict), its host
+    let own = gt_w(c, anyf, us)                         # the latest <|fetch|> (scheme marker) is not the source's
+    let cur_req = tok_feat(g, "F_REQ")
+    let e = latest(g, "last_end", andb(c, [w_lin(c, [(cur_end, 1), (cur_req, 1)], 0)], [own]), [pos])[0]
+    let L = w_lin(c, [(e, 1), (us, -1)], -1)
+    # the fragment (v2's rule): Le, the length up to the first '#' (L without one); always L with v1's characters
+    let hsh: list[int] = []
+    let fhh: list[(int, int)] = []
+    let anyhh: list[(int, int)] = []
+    for j in 0..UMAX {
+        let hj = andb(c, [eqm(x, sv[j], 35), geb(c, w_lin(c, [(L, 1)], -j), 1)], [])
+        let first = andb(c, [hj], hsh)
+        push(fhh, (first, j))
+        push(anyhh, (first, 1))
+        push(hsh, hj)
+    }
+    let Le = w_lin(c, [(w_lin(c, fhh, 0), 1), (gate_by(c, L, notb(c, w_lin(c, anyhh, 0))), 1)], 0)
+    let ccnt: list[(int, int)] = [(L, -1)]
+    for j in 0..UMAX { push(ccnt, (gate_by(c, sc[j], geb(c, L, j + 1)), 1)) }
+    let chars_ok = eqb(c, w_lin(c, ccnt, 0), 0)
+    let len_ok = andb(c, [geb(c, L, 1), leb(c, L, UMAX)], [])
+    let hsp: list[int] = [geb(c, Le, 8)]
+    let hs0 = "https://"
+    for j in 0..len(hs0) { push(hsp, eqm(x, sv[j], hs0[j])) }
+    let is_https = andb(c, hsp, [])
+    let hp: list[int] = [geb(c, Le, 7)]
+    let h0 = "http://"
+    for j in 0..len(h0) { push(hp, eqm(x, sv[j], h0[j])) }
+    let is_http = andb(c, hp, [])
+    let scheme = w_lin(c, [(is_https, 1), (is_http, 1)], 0)
+    let al: list[(int, int)] = []
+    for org in allow {
+        check_origin(org)
+        let n = len(org)
+        let m: list[int] = [geb(c, Le, n)]
+        for j in 0..n { push(m, eqm(x, sv[j], org[j])) }
+        push(m, w_lin(c, [(eqb(c, Le, n), 1), (andb(c, [geb(c, Le, n + 1), eqm(x, sv[n], 47)], []), 1)], 0))
+        push(al, (andb(c, m, []), 1))
+    }
+    let allowed = w_lin(c, al, 0)
+    # a redirect's connect line: an allowed origin's HOST:PORT (fetch v2's connect line for it), the marker's scheme
+    let ar: list[(int, int)] = []
+    for org in allow {
+        let cl = connect_line(org)
+        let n = len(cl)
+        let m: list[int] = [eqb(c, L, n)]
+        if starts_with(org, "https://") { push(m, is_tls) } else { push(m, notb(c, is_tls)) }
+        for j in 0..n { push(m, eqm(x, sv[j], cl[j])) }
+        push(ar, (andb(c, m, []), 1))
+    }
+    let rallowed = w_lin(c, ar, 0)
+    let c_call = andb(c, [cur_end, len_ok, chars_ok, scheme, allowed, geb(c, us, 1)], [own, is_rdr])
+    let c_rdr = andb(c, [cur_req, is_rdr, len_ok, chars_ok, rallowed], [own])
+    force(o, w_lin(c, [(c_call, 1), (c_rdr, 1)], 0), MLO + 0)
+    let c_q4 = w_lin(c, [(c_call, 1), (c_rdr, 1)], 0)
+    # the host: slots s0 .. hs - 1 (hs: the first ':' or '/' from slot 8, or Le; for a connect line s0 = 0 and hs its
+    # ':')
+    let https_c = andb(c, [is_https], [is_rdr])
+    let http_c = andb(c, [is_http], [is_rdr])
+    let s0 = w_lin(c, [(https_c, 8), (http_c, 7)], 0)
+    let fh: list[(int, int)] = []
+    let fany: list[int] = []
+    let ishs: list[int] = []
+    for j in 0..UMAX {
+        let ish = w_lin(c, [(eqm(x, sv[j], 47), 1), (eqm(x, sv[j], 58), 1)], 0)
+        if j < 8 { ish = andb(c, [ish, is_rdr], []) }
+        let f = andb(c, [ish, geb(c, w_lin(c, [(Le, 1)], -j), 1)], ishs)
+        push(ishs, ish)
+        push(fany, f)
+        push(fh, (f, j))
+    }
+    let anyh = sumw(c, fany)
+    let hs = w_lin(c, [(w_lin(c, fh, 0), 1), (gate_by(c, Le, notb(c, anyh)), 1)], 0)
+    let HL = diff(c, hs, s0)
+    # labels: B_j (a '.' in the host, or past it); LL_j = the length of the label after slot j
+    let Bw: list[int] = []
+    let dots: list[int] = []
+    for j in 0..UMAX {
+        let inh = geb(c, w_lin(c, [(hs, 1)], -j), 1)          # j < hs
+        let dj = andb(c, [eqm(x, sv[j], 46), inh], [])
+        push(dots, dj)
+        push(Bw, w_lin(c, [(dj, 1), (inh, -1)], 1))            # dot, or j >= hs
+    }
+    let qbv: list[(int, int)] = []
+    let tq = diff(c, pos, mpos)                                # the query's byte index at the next position
+    let jsel = w_lin(c, [(tq, 1), (s0, 1)], -13)
+    for j in -1..UMAX {
+        # slot j's query byte: the length of the label after it at a '.' (or where the host starts: after "//",
+        # before a connect line's slot 0), else its character
+        let ll: list[(int, int)] = []
+        for k in j + 1..UMAX {
+            let neg: list[int] = []
+            for m in j + 1..k + 1 { push(neg, Bw[m]) }
+            push(ll, (andb(c, [], neg), 1))
+        }
+        let LLj = w_lin(c, ll, 0)
+        if j == -1 {
+            push(qbv, (gate_by(c, LLj, andb(c, [is_rdr, eqm(x, jsel, -1)], [])), 1))
+        } else {
+            let Dj = dots[j]
+            if j == 6 { Dj = w_lin(c, [(dots[j], 1), (http_c, 1)], 0) }
+            if j == 7 { Dj = w_lin(c, [(dots[j], 1), (https_c, 1)], 0) }
+            let v = w_lin(c, [(gate_by(c, LLj, Dj), 1), (gate_by(c, sv[j], notb(c, Dj)), 1)], 0)
+            push(qbv, (gate_by(c, v, eqm(x, jsel, j)), 1))
+        }
+    }
+    let QB = w_lin(c, qbv, 0)
+
+    # ---- the query: bytes by their index tq (pos - the latest query marker)
+    let (idhi, idlo) = div256(c, q0)
+    let qend = w_lin(c, [(HL, 1)], 18)                         # the query's length: <|d_send|> at tq = 18 + HL
+    let qv: list[(int, int)] = [(gate_by(c, idhi, eqm(x, tq, 0)), 1), (gate_by(c, idlo, eqm(x, tq, 1)), 1),
+        (eqm(x, tq, 2), 1), (eqm(x, tq, 5), 1),
+        (gate_by(c, QB, andb(c, [geb(c, tq, 12), ge_w(c, w_lin(c, [(HL, 1)], 12), tq)], [])), 1),
+        (gate_by(c, w_lin(c, [(isq6, 27)], 1), eq_w(c, tq, w_lin(c, [(HL, 1)], 15))), 1),
+        (eq_w(c, tq, w_lin(c, [(HL, 1)], 17)), 1)]
+    let QOUT = w_lin(c, qv, 0)
+    let ph_qb = andb(c, [ph_q, gt_w(c, qend, tq)], [])
+    force(o, andb(c, [ph_q, eq_w(c, tq, qend)], []), MLO + 2)
+
+    # ---- level 2: the tape (the copy head at VB + pos - d: the answer's byte for the next token)
+    let wv: list[int] = []
+    for n in wnames() { push(wv, tok_feat(g, n)) }
+    let win = read_at(g, "copy", w_lin(c, [(pos, 1), (d, -1)], VB), wv)
+    let x0 = W(win, 0)
+    let rb = W(win, -1)
+    let pv = w_lin(c, [(rb, 256), (x0, 1)], -49152)            # a pointer's value at its first byte
+    let i = diff(c, pos, d)
+    let QE = w_lin(c, [(d, 1), (q0, -1)], -1)                  # the query's length (the question ends there)
+
+    # ---- per-position values read by later heads, and those heads
+    let lab = latest(g, "last_lab", tok_feat(g, "LK"), [pos, rb])
+    let lqz = latest(g, "last_qz", tok_feat(g, "F_QZ"), [pos])[0]
+    let lrr = latest(g, "last_rr", tok_feat(g, "RR"), [pos, tok_feat(g, "RRI")])
+    let rdl_here = w_lin(c, [(W(win, -2), 256), (rb, 1)], 0)
+    let lrd = latest(g, "last_rd", tok_feat(g, "RD"), [pos, rdl_here, tok_feat(g, "RD6"), tok_feat(g, "RDA")])
+    let lrc = latest(g, "last_rc", tok_feat(g, "RC"), [pos, tok_feat(g, "RCI")])
+    let apv: list[int] = [pos]
+    for k in 0..16 { push(apv, win[k]) }                      # W[-16] .. W[-1]: the address ending at this token
+    let lap = latest(g, "last_ap", tok_feat(g, "F_AP"), apv)
+    let lav = latest(g, "last_av", tok_feat(g, "F_AV"), [pos])[0]
+    let lhe = latest(g, "last_hend", tok_feat(g, "F_HEND"), [pos, W(win, -5)])
+    let lns = latest(g, "last_nst", tok_feat(g, "NST"), [pos])
+    let qb = read_at(g, "qbyte", w_lin(c, [(q0, 1), (i, 1)], 1), [tok_feat(g, "XB")])[0]
+
+    # ---- names (tfs/dns.py Spec.name_map / name_match). A name is read as runs of bytes in place, each ended by a
+    # zero byte or a pointer (the run's terminator, NT); after a pointer, the run at its target. rsv: the run start of
+    # this position's name (the latest name start's offset, else the question's, 12), and its one-hot digits (base
+    # 64): the key by which a later head finds a run's terminator.
+    let ns = lns[0]
+    let has_ns = gt_w(c, ns, d)
+    let own0 = w_lin(c, [(ns, 1), (d, -1)], -1)
+    let rsv = w_lin(c, [(gate_by(c, own0, has_ns), 1), (notb(c, has_ns), 12)], 0)
+    let hot = hot64(c, rsv)
+    let lnt = latest(g, "last_nt", tok_feat(g, "NT"), [pos, pv, tok_feat(g, "ZK")])
+    # the latest name's map: run 0 from its start to the latest terminator, then up to HOPS pointers followed (each
+    # strictly backward, onto a label's length byte or a pointer the net parsed; the run there found by its start)
+    let e0 = w_lin(c, [(lnt[0], 1), (d, -1)], -1)
+    let zk0 = lnt[2]
+    let len0 = w_lin(c, [(e0, 1), (rsv, -1), (zk0, 1)], 0)
+    let sts: list[int] = [rsv]
+    let lens: list[int] = [len0]
+    let inval: list[(int, int)] = []
+    let act = notb(c, zk0)
+    let T = gate_by(c, lnt[1], act)
+    let eprev = e0
+    for h in 1..HOPS + 1 {
+        let rv: list[int] = [tok_feat(g, "LK"), tok_feat(g, "PK"), rsv]
+        for w in hot { push(rv, w) }
+        let r = read_at(g, format("hop{}", h), w_lin(c, [(d, 1), (T, 1)], 1), rv)
+        let qh: list[int] = []
+        for k in 0..len(hot) { push(qh, r[3 + k]) }
+        let tm = match_head(g, format("term{}", h), qh, hot, tok_feat(g, "NT"), [pos, pv, tok_feat(g, "ZK"), rsv])
+        let lt = gt_w(c, eprev, T)
+        let found = andb(c, [gt_w(c, tm[0], d), eq_w(c, tm[3], r[2]), ge_w(c, tm[0], w_lin(c, [(d, 1), (T, 1)], 1))],
+            [])
+        let okh = andb(c, [lt, w_lin(c, [(r[0], 1), (r[1], 1)], 0), found], [])
+        push(inval, (andb(c, [act], [okh]), 1))
+        let eh = w_lin(c, [(tm[0], 1), (d, -1)], -1)
+        let live = andb(c, [act, okh], [])
+        push(sts, T)
+        push(lens, gate_by(c, w_lin(c, [(eh, 1), (T, -1), (tm[2], 1)], 0), live))
+        act = andb(c, [live], [tm[2]])
+        T = gate_by(c, tm[1], act)
+        eprev = eh
+    }
+    push(inval, (act, 1))                                       # still a pointer after HOPS of them
+    let valid = notb(c, geb(c, w_lin(c, inval, 0), 1))
+    let cums: list[int] = [len0]                                 # cums[k]: the index after run k
+    for h in 1..HOPS + 1 { push(cums, w_lin(c, [(cums[h - 1], 1), (lens[h], 1)], 0)) }
+    # the first non-empty run after run 0: where the name's first pointer leads
+    let tst: list[(int, int)] = []
+    for h in 1..HOPS + 1 { push(tst, (gate_by(c, sts[h], andb(c, [geb(c, lens[h], 1), eq_w(c, cums[h - 1], len0)], [])), 1)) }
+    let tstar = w_lin(c, tst, 0)
+    # the chain's current name: the latest CNAME target's map (at its end), else the question's (12, QE - 16)
+    let cev: list[int] = [pos]
+    for w in sts { push(cev, w) }
+    for w in cums { push(cev, w) }
+    let lce = latest(g, "last_cend", tok_feat(g, "CEND"), cev)
+    let has_ce = gt_w(c, lce[0], d)
+    let qlen = w_lin(c, [(QE, 1)], -16)
+    let cst: list[int] = [w_lin(c, [(gate_by(c, lce[1], has_ce), 1), (notb(c, has_ce), 12)], 0)]
+    for h in 1..HOPS + 1 { push(cst, gate_by(c, lce[1 + h], has_ce)) }
+    let ccum: list[int] = []
+    for h in 0..HOPS + 1 {
+        push(ccum, w_lin(c, [(gate_by(c, lce[2 + HOPS + h], has_ce), 1), (gate_by(c, qlen, notb(c, has_ce)), 1)], 0))
+    }
+    # an owner byte in place against the chain name's byte at the same index (case-insensitively)
+    let jo = w_lin(c, [(i, 1), (rsv, -1)], -1)
+    let pcb = map_pos(c, cst, ccum, jo)
+    let cb = read_at(g, "cbyte", w_lin(c, [(d, 1), (pcb, 1)], 1), [rb])[0]
+    let mis = andb(c, [tok_feat(g, "OB")], [eq_w(c, fold(c, rb), fold(c, cb))])
+    let lmis = latest(g, "last_mis", mis, [pos])[0]
+    # the owner (the latest name) is the chain's name: no byte differed, and it ended in place, or its first pointer
+    # leads to the chain name's offset at the same index
+    let nomis = notb(c, ge_w(c, lmis, ns))
+    let nm = andb(c, [valid, nomis, or2(c, zk0, eq_w(c, tstar, map_pos(c, cst, ccum, len0)))], [])
+
+
+    # ---- the answer: what the token after this one is
+    let term = geb(c, x0, 256)
+    let t_cfail = eqm(x, x0, 258)
+    let has_rr = gt_w(c, lrr[0], d)
+    let nrec = gate_by(c, lrr[1], has_rr)
+    let AN = lhe[1]
+    let more = notb(c, eq_w(c, nrec, AN))
+    let rde = w_lin(c, [(lrd[0], 1), (lrd[1], 1)], 0)            # the latest record's last RDATA byte's position
+    let in_rd = gt_w(c, rde, pos)
+    let endish = w_lin(c, [(sb(x, stf, st, "ap"), 1), (sb(x, stf, st, "aq"), 1), (sb(x, stf, st, "av"), 1),
+        (sb(x, stf, st, "au"), 1), (sb(x, stf, st, "cz"), 1), (sb(x, stf, st, "cq"), 1)], 0)
+    let rxish = w_lin(c, [(sb(x, stf, st, "rx"), 1), (sb(x, stf, st, "x"), 1)], 0)
+    let qtish = sb(x, stf, st, "qt")
+    let qt_more = gt_w(c, w_lin(c, [(lqz, 1)], 4), pos)         # pos - lqz < 4
+    let rec_over = w_lin(c, [(endish, 1), (andb(c, [rxish], [in_rd]), 1), (andb(c, [qtish], [qt_more]), 1)], 0)
+    let dec_here = andb(c, [ph_ans, rec_over], [more])
+    let reads = andb(c, [ph_ans, w_lin(c, [(cur_send, 1), (isst, 1)], 0)], [dec_here])
+    let echo_reg = andb(c, [geb(c, i, 12), gt_w(c, QE, i)], [])
+    let echo_bad = andb(c, [reads, echo_reg], [term, eq_w(c, x0, qb)])
+    let ok = andb(c, [reads], [term, echo_bad])
+    let bads: list[(int, int)] = [(andb(c, [reads, term], [t_cfail]), 1), (echo_bad, 1)]
+    let nones: list[(int, int)] = [(andb(c, [reads, term, t_cfail], []), 1)]
+
+    # a label byte x0: 0 / 1..63 / a pointer / bad
+    let xz = eqm(x, x0, 0)
+    let xl = inr(c, x0, 1, 63)
+    let xp = inr(c, x0, 192, 255)
+    let xo = andb(c, [], [xz, xl, xp])
+
+    # the header: bytes 0 .. 11, decided at byte 11
+    force(o, andb(c, [ok, cur_send], []), sid(SLO, st, "hdr"))
+    let s_hdr = sb(x, stf, st, "hdr")
+    force(o, andb(c, [ok, s_hdr, leb(c, i, 10)], []), sid(SLO, st, "hdr"))
+    let hd = andb(c, [ok, s_hdr, eqm(x, i, 11)], [])
+    let id_ok = andb(c, [eq_w(c, W(win, -11), idhi), eq_w(c, W(win, -10), idlo), inr(c, W(win, -9), 128, 135)], [])
+    let r2 = W(win, -9)
+    let tcb = w_lin(c, [(eqm(x, r2, 130), 1), (eqm(x, r2, 131), 1), (eqm(x, r2, 134), 1), (eqm(x, r2, 135), 1)], 0)
+    let rcode = mod16(c, W(win, -8))
+    let rc0 = eqm(x, rcode, 0)
+    let rc3 = eqm(x, rcode, 3)
+    let cnt_ok = andb(c, [eqm(x, W(win, -7), 0), eqm(x, W(win, -6), 1), eqm(x, W(win, -5), 0), leb(c, W(win, -4), RMAX)], [])
+    push(bads, (andb(c, [hd], [id_ok]), 1))
+    force(o, andb(c, [hd, id_ok, tcb], []), MLO + 10)
+    let hgo = andb(c, [hd, id_ok], [tcb])
+    force(o, andb(c, [hgo, rc3], []), MLO + 6)
+    push(nones, (andb(c, [hgo], [rc3, rc0]), 1))
+    push(bads, (andb(c, [hgo, rc0], [cnt_ok]), 1))
+    force(o, andb(c, [hgo, rc0, cnt_ok], []), sid(SLO, st, "hend"))
+
+    # the question's name (no pointers), QTYPE / QCLASS
+    let s_hend = sb(x, stf, st, "hend")
+    force(o, andb(c, [ok, s_hend, xz], []), sid(SLO, st, "qz"))
+    force(o, andb(c, [ok, s_hend, xl], []), sid(SLO, st, "ql"))
+    push(bads, (andb(c, [ok, s_hend], [xz, xl]), 1))
+    let inlab = ge_w(c, w_lin(c, [(lab[0], 1), (lab[1], 1)], 0), plus(c, pos, 1))
+    let in_q = w_lin(c, [(sb(x, stf, st, "ql"), 1), (sb(x, stf, st, "qc"), 1)], 0)
+    force(o, andb(c, [ok, in_q, inlab], []), sid(SLO, st, "qc"))
+    force(o, andb(c, [ok, in_q, xz], [inlab]), sid(SLO, st, "qz"))
+    force(o, andb(c, [ok, in_q, xl], [inlab]), sid(SLO, st, "ql"))
+    push(bads, (andb(c, [ok, in_q], [inlab, xz, xl]), 1))
+    force(o, andb(c, [ok, sb(x, stf, st, "qz")], []), sid(SLO, st, "qt"))
+    force(o, andb(c, [ok, qtish, qt_more], []), sid(SLO, st, "qt"))
+
+    # where a record may start: after the question, after a record's end (more records to come)
+    let rstart = andb(c, [ok, rec_over], [])                   # (ok implies more: dec_here is off)
+    force(o, andb(c, [rstart, xz], []), sid(SLO, st, "nz0"))
+    force(o, andb(c, [rstart, xl], []), sid(SLO, st, "nl0"))
+    force(o, andb(c, [rstart, xp], []), sid(SLO, st, "np0"))
+    push(bads, (andb(c, [rstart, xo], []), 1))
+
+    # an owner name
+    let in_n = w_lin(c, [(sb(x, stf, st, "nl0"), 1), (sb(x, stf, st, "nl"), 1), (sb(x, stf, st, "nc"), 1)], 0)
+    force(o, andb(c, [ok, in_n, inlab], []), sid(SLO, st, "nc"))
+    force(o, andb(c, [ok, in_n, xz], [inlab]), sid(SLO, st, "nz"))
+    force(o, andb(c, [ok, in_n, xl], [inlab]), sid(SLO, st, "nl"))
+    force(o, andb(c, [ok, in_n, xp], [inlab]), sid(SLO, st, "np"))
+    push(bads, (andb(c, [ok, in_n, xo], [inlab]), 1))
+    force(o, andb(c, [ok, w_lin(c, [(sb(x, stf, st, "np0"), 1), (sb(x, stf, st, "np"), 1)], 0)], []),
+        sid(SLO, st, "nq"))
+    # the fixed fields: TYPE hi is <|d_rrK|> (K the record's number), then 8 <|d_f|>, then RDLENGTH lo decides
+    let n_end = w_lin(c, [(sb(x, stf, st, "nz0"), 1), (sb(x, stf, st, "nz"), 1), (sb(x, stf, st, "nq"), 1)], 0)
+    for k in 0..RMAX { force(o, andb(c, [ok, n_end, eqm(x, nrec, k)], []), sid(SLO, st, format("rr{}", k + 1))) }
+    let in_fix = w_lin(c, [(sb(x, stf, st, "rr1"), 1), (sb(x, stf, st, "f"), 1)], 0)
+    let foff = diff(c, pos, lrr[0])
+    force(o, andb(c, [ok, in_fix, leb(c, foff, 7)], []), sid(SLO, st, "f"))
+    let rdd = andb(c, [ok, in_fix, eqm(x, foff, 8)], [])
+    let thi = eqm(x, W(win, -9), 0)
+    let tA = andb(c, [thi, eqm(x, W(win, -8), 1)], [])
+    let t6 = andb(c, [thi, eqm(x, W(win, -8), 28)], [])
+    let t5 = andb(c, [thi, eqm(x, W(win, -8), 5)], [])
+    let cIN = andb(c, [eqm(x, W(win, -7), 0), eqm(x, W(win, -6), 1)], [])
+    let rdhi0 = eqm(x, rb, 0)
+    let rdl4 = andb(c, [rdhi0, eqm(x, x0, 4)], [])
+    let rdl16 = andb(c, [rdhi0, eqm(x, x0, 16)], [])
+    let rdl0 = andb(c, [rdhi0, xz], [])
+    let mt = andb(c, [nm, cIN], [])
+    push(bads, (andb(c, [rdd], [valid]), 1))
+    let qA = notb(c, isq6)
+    let mA = andb(c, [rdd, mt, tA, qA], [])
+    force(o, andb(c, [mA, rdl4], []), sid(SLO, st, "ra"))
+    push(bads, (andb(c, [mA], [rdl4]), 1))
+    let m6 = andb(c, [rdd, mt, t6, isq6], [])
+    force(o, andb(c, [m6, rdl16], []), sid(SLO, st, "r6"))
+    push(bads, (andb(c, [m6], [rdl16]), 1))
+    let m5 = andb(c, [rdd, mt, t5], [])
+    let has_rc = gt_w(c, lrc[0], d)
+    let nrc = gate_by(c, lrc[1], has_rc)
+    for k in 0..CMAX { force(o, andb(c, [m5, eqm(x, nrc, k)], [rdl0]), sid(SLO, st, format("rc{}", k + 1))) }
+    push(bads, (andb(c, [m5, or2(c, rdl0, geb(c, nrc, CMAX))], []), 1))
+    let anym = w_lin(c, [(andb(c, [mt, tA, qA], []), 1), (andb(c, [mt, t6, isq6], []), 1), (andb(c, [mt, t5], []), 1)], 0)
+    # an address record of another name (IN, the query's type and length): its address is checked too
+    let ruc = andb(c, [cIN, w_lin(c, [(andb(c, [tA, qA, rdl4], []), 1), (andb(c, [t6, isq6, rdl16], []), 1)], 0)], [nm])
+    force(o, andb(c, [rdd, valid, ruc], []), sid(SLO, st, "ru"))
+    force(o, andb(c, [rdd, valid], [anym, ruc]), sid(SLO, st, "rx"))
+
+    # RDATA: an address, a CNAME target, skipped bytes
+    let in_a = w_lin(c, [(sb(x, stf, st, "ra"), 1), (sb(x, stf, st, "r6"), 1), (sb(x, stf, st, "ru"), 1),
+        (sb(x, stf, st, "a"), 1)], 0)
+    let roff = diff(c, pos, lrd[0])
+    let rd6 = isq6
+    let nlast = w_lin(c, [(rd6, 12)], 3)                       # n - 1: 3 (A) or 15 (AAAA)
+    force(o, andb(c, [ok, in_a, gt_w(c, nlast, roff)], []), sid(SLO, st, "a"))
+    let afin = andb(c, [ok, in_a, eq_w(c, roff, nlast)], [])
+    let a4: list[int] = []
+    for k in -3..1 { push(a4, W(win, k)) }
+    let a16: list[int] = []
+    for k in -15..1 { push(a16, W(win, k)) }
+    let pub = w_lin(c, [(andb(c, [public4(x, a4)], [rd6]), 1), (andb(c, [public6(x, a16), rd6], []), 1)], 0)
+    let has_ap = gt_w(c, lap[0], d)
+    force(o, andb(c, [afin], [pub]), sid(SLO, st, "av"))
+    let rda = lrd[3]                                           # the record is the name's (else <|d_ru|>)
+    force(o, andb(c, [afin, pub, rda, has_ap], []), sid(SLO, st, "aq"))
+    force(o, andb(c, [afin, pub, rda], [has_ap]), sid(SLO, st, "ap"))
+    force(o, andb(c, [afin, pub], [rda]), sid(SLO, st, "au"))
+    force(o, andb(c, [ok, rxish, in_rd], []), sid(SLO, st, "x"))
+    # a CNAME target: a name that must end exactly at the RDATA's end
+    let last = eqm(x, diff(c, rde, pos), 1)                    # the next byte is the RDATA's last
+    let s_rc = sb(x, stf, st, "rc1")
+    force(o, andb(c, [ok, s_rc, xl], [last]), sid(SLO, st, "cl0"))
+    force(o, andb(c, [ok, s_rc, xp], [last]), sid(SLO, st, "cp0"))
+    push(bads, (andb(c, [ok, s_rc], [andb(c, [xl], [last]), andb(c, [xp], [last])]), 1))
+    let in_c = w_lin(c, [(sb(x, stf, st, "cl0"), 1), (sb(x, stf, st, "cl"), 1), (sb(x, stf, st, "cc"), 1)], 0)
+    force(o, andb(c, [ok, in_c, inlab], [last]), sid(SLO, st, "cc"))
+    force(o, andb(c, [ok, in_c, xz, last], [inlab]), sid(SLO, st, "cz"))
+    force(o, andb(c, [ok, in_c, xl], [inlab, last]), sid(SLO, st, "cl"))
+    force(o, andb(c, [ok, in_c, xp], [inlab, last]), sid(SLO, st, "cp"))
+    push(bads, (andb(c, [ok, in_c, inlab, last], []), 1))
+    push(bads, (andb(c, [ok, in_c, xz], [inlab, last]), 1))
+    push(bads, (andb(c, [ok, in_c, last], [inlab, xz]), 1))
+    push(bads, (andb(c, [ok, in_c, xo], [inlab, last]), 1))
+    let in_cp = w_lin(c, [(sb(x, stf, st, "cp0"), 1), (sb(x, stf, st, "cp"), 1)], 0)
+    let cq_bad = w_lin(c, [(notb(c, last), 1), (notb(c, valid), 1)], 0)       # not the end; a bad pointer
+    force(o, andb(c, [ok, in_cp], [cq_bad]), sid(SLO, st, "cq"))
+    push(bads, (andb(c, [ok, in_cp, geb(c, cq_bad, 1)], []), 1))
+
+    # the decision, after the answer section's last record
+    let has_av = gt_w(c, lav, d)
+    force(o, andb(c, [dec_here, has_av], []), MLO + 7)
+    force(o, andb(c, [dec_here, has_ap, qA], [has_av]), MLO + 3)
+    force(o, andb(c, [dec_here, has_ap, isq6], [has_av]), MLO + 4)
+    force(o, andb(c, [dec_here, qA], [has_av, has_ap]), MLO + 1)
+    push(nones, (andb(c, [dec_here, isq6], [has_av, has_ap]), 1))
+
+    let c_bad = w_lin(c, bads, 0)
+    let c_none = w_lin(c, nones, 0)
+    force(o, c_bad, MLO + 8)
+    force(o, c_none, MLO + 9)
+    force(o, cur_reason, FFAIL)
+    force(o, andb(c, [cur_retry], [isq6]), MLO + 11)
+    force(o, andb(c, [cur_retry, isq6], []), MLO + 12)
+
+    # ---- the chosen address's bytes, then <|d_go|>
+    let ioff = diff(c, pos, mpos)
+    let alast = w_lin(c, [(is_ip6, 12)], 4)                    # n: 4 or 16
+    let ab: list[(int, int)] = []
+    for k in 0..16 {
+        let at4 = andb(c, [eqm(x, ioff, k)], [is_ip6])
+        let at6 = andb(c, [eqm(x, ioff, k), is_ip6], [])
+        if k < 4 { push(ab, (gate_by(c, lap[1 + 12 + k], at4), 1)) }
+        push(ab, (gate_by(c, lap[1 + k], at6), 1))
+    }
+    let AOUT = w_lin(c, ab, 0)
+    let ph_ab = andb(c, [ph_ip, gt_w(c, alast, ioff)], [])
+    force(o, andb(c, [ph_ip, eq_w(c, ioff, alast)], []), MLO + 5)
+
+    # ---- the bytes: the query's and the address's
+    let BOUT = w_lin(c, [(gate_by(c, QOUT, ph_qb), 1), (gate_by(c, AOUT, ph_ab), 1)], 0)
+    let emitb = w_lin(c, [(ph_qb, 1), (ph_ab, 1)], 0)
+    for v in 0..NBYTE { force(o, andb(c, [emitb, eqm(x, BOUT, v)], []), lo + v) }
+
+    # ---- the call again: <|fetch|> URL <|fetch_end|> (the call's characters, slot by slot)
+    let goff = ioff
+    force(o, andb(c, [ph_go, eqm(x, goff, 0)], [is_rdr]), FETCH)
+    if flo2 >= 0 {                                   # a redirect: fetch v2's scheme marker, the connect line, <|h_req|>
+        force(o, andb(c, [ph_go, eqm(x, goff, 0), is_rdr, is_tls], []), flo2 + NEXTRA2 + 1)
+        force(o, andb(c, [ph_go, eqm(x, goff, 0), is_rdr], [is_tls]), flo2 + NEXTRA2)
+        force(o, andb(c, [ph_go, is_rdr, eq_w(c, goff, w_lin(c, [(L, 1)], 1))], []), flo2 + NEXTRA2 + 2)
+    }
+    let in_copy = andb(c, [ph_go, geb(c, goff, 1), ge_w(c, L, goff)], [])
+    let cis: list[(int, int)] = []
+    for j in 0..UMAX { push(cis, (gate_by(c, sci[j], eqm(x, goff, j + 1)), 1)) }
+    let CI = w_lin(c, cis, 0)
+    for k in 0..len(UCH) {
+        let tk = flo + 2 + k
+        if k >= len(CHARS) { tk = flo2 + extra_index(UCH[k]) }
+        force(o, andb(c, [in_copy, eqm(x, CI, k)], []), tk)
+    }
+    force(o, andb(c, [ph_go, eq_w(c, goff, w_lin(c, [(L, 1)], 1))], [is_rdr]), FEND)
+
+    let fire = w_lin(c, o.fire, 0)
+    toolnet.name(g, "fire", fire)
+    let out: list[int] = []
+    for b in 0..nb { push(out, w_lin(c, o.ot[b], 0)) }
+    let notfire = kr(c, nb, [(fire, -1)], 1)
+    for sn in [("d", d), ("mk", mk), ("mpos", mpos), ("q0", q0), ("L", L), ("us", us), ("hs", hs), ("HL", HL),
+        ("QB", QB), ("QOUT", QOUT), ("x0", x0), ("rb", rb), ("i", i), ("QE", QE), ("qb", qb), ("rsv", rsv),
+        ("valid", valid), ("nm", nm), ("tstar", tstar), ("lmis", lmis), ("pcb", pcb), ("cb", cb), ("nrec", nrec), ("AN", AN), ("rde", rde), ("reads", reads), ("ok", ok),
+        ("dec_here", dec_here), ("c_bad", c_bad), ("c_none", c_none), ("allowed", allowed), ("c_q4", c_q4),
+        ("match", mt), ("pub", pub), ("BOUT", BOUT), ("CI", CI), ("echo_bad", echo_bad), ("inlab", inlab)] {
+        toolnet.name(g, sn.0, sn.1)
+    }
+    return toolnet.built(g, "dns", nb, lo, S, out, fire, notfire)
+}
+
+
+# ---- why the net is silent (proved when this file loads) -------------------------------------------------------
+# Every case bit is andb(pos, neg) = relu(sum pos - sum neg - n + 1) over 0/1 bits with a phase bit among pos:
+# cur_end (the token is <|fetch_end|>), ph_q / ph_ans / ph_ip / ph_go ([the latest DNS marker is a query, a send, an
+# address, <|d_go|>]) or cur_reason (the token is a reason marker); `reads`, `ok`, `dec_here`, `hd`, `rdd`, `afin`
+# are such ANDs with ph_ans among their inputs, and the sums (bad, none) are sums of them. Outside a DNS block (no
+# DNS marker yet, or the latest is <|d_go|> past the copy's <|fetch_end|>, or a reason before this position) every
+# phase bit is 0, so every case bit is 0 (`and_off`); [mk == v] is exactly 0 or 1 for an integer mk (`eq_bit`); the
+# output code and fire are sums of case bits times constants: exactly 0, and notfire = nb relu(1 - 0) = nb
+# (`not_fired`). (ph_go is 1 after a copy, but every case under it is an AND with goff <= L + 1.)
+fn relu(x) {
+    if x > 0 { return x }
+    return 0
+}
+fn eq_ref(d, v) {
+    if d == v { return 1 }
+    return 0
+}
+theorem and_off(s, z, n) {
+    requires 1 <= n & n <= 100
+    requires 0 <= s & s <= n - 1
+    requires 0 <= z & z <= 100
+    ensures relu(s - z - n + 1) == 0
+}
+theorem eq_bit(d, v) {
+    requires -1000000 <= d & d <= 1000000
+    requires -1000000 <= v & v <= 1000000
+    ensures relu(d - v + 1) - relu(d - v) + relu(v - d + 1) - relu(v - d) - 1 == eq_ref(d, v)
+}
+theorem not_fired(nb) {
+    requires 1 <= nb & nb <= 64
+    ensures nb * relu(0 - 0 + 1) == nb
+}
+
+let argv = args()
+let lo0 = 592
+let flo0 = 395
+let vv = 909
+let allow: list[str] = []
+let flo20 = -1
+if len(argv) > 3 {
+    lo0 = unwrap(try_parse_int(argv[0]))
+    flo0 = unwrap(try_parse_int(argv[1]))
+    vv = unwrap(try_parse_int(argv[2]))
+    if argv[3] != "-" { allow = split(argv[3], ",") }
+}
+if len(argv) > 4 { flo20 = unwrap(try_parse_int(argv[4])) }
+let bt = build(lo0, flo0, vv, allow, flo20)
+print(toolnet.summary(bt), format("({} allowed origins)", len(allow)))
+if len(argv) > 5 {
+    toolnet.export(bt, argv[5])
+    print("exported to", argv[5])
+}

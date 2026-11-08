@@ -1,0 +1,106 @@
+{
+  "host_name_resolution_disabled": true,
+  "dns_selected_peer_verified": true,
+  "live": {
+    "backend": "python-numpy-int64-reference",
+    "compiled_not_trained": true,
+    "url": "https://example.com",
+    "positions": 1106,
+    "circuit_matches_spec": true,
+    "ending": "<|fetch_done|>",
+    "network_connections": 1,
+    "seconds": 16.65,
+    "dns_in_weights": true,
+    "dns_network_exchanges": 1,
+    "wires": 22102,
+    "operations": 20538,
+    "attention_heads": 109,
+    "levels": 120,
+    "receipts": [
+      {
+        "mode": "live",
+        "target": "example.com:443",
+        "request_sha256": "d358038dbaa59af084ae0b874f4cfac45a756b2655e5172f2d67032b059e69a7",
+        "sent_bytes": 134,
+        "response_bytes": 931,
+        "network_connections": 1,
+        "tls": "TLSv1.3",
+        "certificate_verified": true,
+        "sent_exact_circuit_bytes": true,
+        "connected_address": "104.20.23.154",
+        "peer_address": "104.20.23.154",
+        "tls_server_hostname": "example.com",
+        "dns": {
+          "backend": "compiled-dns-circuit/numpy-int64",
+          "host": "example.com",
+          "selected_address": "104.20.23.154",
+          "address_version": 4,
+          "positions": 142,
+          "circuit_matches_spec": true,
+          "independent_resolver_matches": true,
+          "scenario": "normal",
+          "network_exchanges": 1,
+          "exchanges": [
+            {
+              "transport": "udp",
+              "qtype": 1,
+              "query_sha256": "817625e89f599a7219534881317019717d2058f46f466794e7332cff90b5e22c",
+              "injected_response": null
+            }
+          ],
+          "token_sha256": "8539b8092ab3e5cc5f07c6b1da15acf234027def8b86d01792a27e0d81fc7f87"
+        },
+        "runtime_target_getaddrinfo_used": false
+      }
+    ],
+    "token_sha256": "d16935d4fa6da14de88012c351adb65df19b470a2b7d6df1f15bd1aee6a60972"
+  },
+  "replay": {
+    "backend": "python-numpy-int64-reference",
+    "compiled_not_trained": true,
+    "url": "https://example.com",
+    "positions": 1106,
+    "circuit_matches_spec": true,
+    "ending": "<|fetch_done|>",
+    "network_connections": 0,
+    "seconds": 21.67,
+    "dns_in_weights": true,
+    "dns_network_exchanges": 0,
+    "wires": 22102,
+    "operations": 20538,
+    "attention_heads": 109,
+    "levels": 120,
+    "receipts": [
+      {
+        "mode": "replay",
+        "target": "example.com:443",
+        "request_sha256": "d358038dbaa59af084ae0b874f4cfac45a756b2655e5172f2d67032b059e69a7",
+        "response_bytes": 931,
+        "network_connections": 0,
+        "dns": {
+          "backend": "compiled-dns-circuit/numpy-int64",
+          "host": "example.com",
+          "selected_address": "104.20.23.154",
+          "address_version": 4,
+          "positions": 142,
+          "circuit_matches_spec": true,
+          "independent_resolver_matches": true,
+          "scenario": "normal",
+          "network_exchanges": 0,
+          "exchanges": [
+            {
+              "transport": "udp",
+              "qtype": 1,
+              "query_sha256": "817625e89f599a7219534881317019717d2058f46f466794e7332cff90b5e22c",
+              "injected_response": null
+            }
+          ],
+          "token_sha256": "8539b8092ab3e5cc5f07c6b1da15acf234027def8b86d01792a27e0d81fc7f87"
+        },
+        "runtime_target_getaddrinfo_used": false
+      }
+    ],
+    "token_sha256": "d16935d4fa6da14de88012c351adb65df19b470a2b7d6df1f15bd1aee6a60972"
+  },
+  "claim_limit": "Two compiled circuits chained by the host runtime; no GPU or LLM policy."
+}
