@@ -1,0 +1,49 @@
+{
+  "source_project": "Ternary",
+  "source_commit": "c1239eb1ba718107e0ce2f18a911c88937db1024",
+  "author": "Khalil Hughes",
+  "extraction": "Fetch3 force circuit and NumPy integer reference; runtime imports adapted for standalone use",
+  "circuit_source_sha256": {
+    "examples/wire/fetch3_net.tern": "9a9e62011fe80ddfd17aec01be7f4095f0ed5ab56ebd12506584fe441e8b3f61",
+    "examples/wire/toolnet.tern": "06e18c35103c4cee74f1380fb0f14805aaa22b5f7fce0920c439437685ecde41",
+    "examples/wire/wire.tern": "ed0460337004851900077cd0f1ff848c450d552083dc03820e0e4c6a70b7825e"
+  },
+  "circuit_artifacts": {
+    "agent.txt": "94d4ef2716c0819f926d327c7f28bc48c8a7d790c3c37b5e7edd2fa48bc1d1a6",
+    "allow.txt": "b7fa3061d28237a56192d486392e4ea376c2b95a56ef9c75df6b37f45d7acc20",
+    "const_v.npy": "185aaf448b02b55e70180f469e7e0abe34fc1eaecf994429f9d4b4a8eb65fffd",
+    "const_w.npy": "bcca689484c3221f2d1e7cf89c5af0f70444c7afcb2c55b59aceacb1c10af970",
+    "feat.txt": "0d56bb41255e72ddb515a65531274b2bfc5952c58a75559f1788e3e5b8daa5d6",
+    "feat_w.npy": "102fe662dbaf8347b89faf811fdc68ae4cb11d4ae28bdfcc43171f9a3a3a6981",
+    "head_d.npy": "2e523267c8d154808baaef2113102bc1413223277856dd055881ba9969a76d81",
+    "head_k.npy": "71a008fc371fed1c37357f302bbac3fb4082088f66c9bb41ffa77fdf632d2b43",
+    "head_o.npy": "7cf354b0757f04f095b324ed29ecaac57de1a82785be23c42dc27ff35ece8898",
+    "head_q.npy": "f5e927e27768b6c151d3b51c531bc8b17e8dc0c58a0650eb9ada1bf6b1878a45",
+    "head_t.npy": "84d07fab5800a6a44bc3e63649d79cffbe5209216f4779a2d60f1fc916903e83",
+    "head_v.npy": "32c637dfd23f4ea6829ea8581bd91116b31e76a1b918f624736a29031fcd7060",
+    "heads.txt": "022029ba9799d7691d2c791b90add25f1f2affc1a7c05b494e131710e824f29e",
+    "layout.json": "4ffab761b9152b90707f6b80ad6f5d593230d4c4398220a8cc5c7c318f81fbaa",
+    "meta.npy": "e074c8b15655edcfd049594584e4bc7eef3b8fbd810442fc2c8ce989f2118ff5",
+    "names.txt": "e9468d8b6b7560991a83d0633ce17ecaff967cd86c214d5611e79e10200aa450",
+    "names_w.npy": "e165577fc4f91383125c58f20d525a3f2f43b7104eb65f2bf8717a6bd13d595a",
+    "op_d.npy": "faef5035cd0689c6746bcdf66ccacb92f95b3c694fb6ca17953c77e446cc0ae6",
+    "op_g.npy": "ad07471e092d49dac8d316689bb315f03de99b7e015a391ee2a390f506493755",
+    "op_l.npy": "0db9c923d7eb247c087943f3b8079d58bc752c4d2c19901e6836b68c33cf5d32",
+    "op_w.npy": "f61cbc75f30916b0884590fa95e1729c1c90cfdddf9b78938722d5fc665b9c29",
+    "out_w.npy": "a469bf2cb30cdafb19047b5b80de14da82c1df725e5ac01658151c0751b97fda",
+    "posf.txt": "f84b4268c1cd5b290fe0379be8703dce27971b481cf08623eebcf8656307f0e3",
+    "posf_w.npy": "9ffe88f6505f8f71267ddf40479565aa30c88e3f912a778fa2ce524d270868e9",
+    "starts.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "tool.txt": "e31e2745fce74a6594af92d8b19786deccd8cc948b5e8d658b82f507024fc3cb",
+    "v3version.txt": "53c234e5e8472b6ac51c1ae1cab3fe06fad053beb8ebfd8977b010655bfdd3c3",
+    "version.txt": "53c234e5e8472b6ac51c1ae1cab3fe06fad053beb8ebfd8977b010655bfdd3c3",
+    "words.txt": "d697cfe60b3f1f877407ac1a152f591eb5411339503e2888609662bc6ab8b1d9"
+  },
+  "excludes": [
+    "model checkpoints",
+    "training datasets",
+    "raw web logs",
+    "credentials",
+    "GPU implementation"
+  ]
+}

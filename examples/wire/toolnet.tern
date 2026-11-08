@@ -1,0 +1,335 @@
+# toolnet: the parts every compiled tool shares (docs/tfs_tools.md). A compiled tool is a net of exact ternary-weight
+# layers that sits beside the integer hybrid, reads the token stream and, where the tool answers, forces the next token;
+# everywhere else its output code and fire bit are exactly 0, so the merged model's logits are the base model's.
+#
+# The pattern of examples/wire/fs_net.tern (the filesystem, docs/tfs.md), as a module:
+# - a graph (`G`): a wire circuit (wire.tern) with a token embedding (named features: the token's code bits as +-1 and
+#   the tool's own flags; the Python side fills the table, tfs/circuit.py) and a position table (pos, bos, and per
+#   offset o the base-32 digits of max(j + o, 0), their squares and the sum of squares);
+# - hard attention heads through the model's integer softmax (tern/intref.py): every winning key's score is at least
+#   GAP = 2^21 above every other key's, so iexp gives the others exactly 0 and the winner probability exactly 2^15:
+#     latest(flag)   the most recent position j <= t with flag_j = 1, else BOS;
+#     abs(target)    the position j = target (base-32 digits a, b, c of the target);
+#     index(k)       the latest record whose index one-hot matches the query's;
+# - circuit helpers: [x == v], [x >= t], [x <= t], ANDs of 0/1 bits, one-hots, code bits;
+# - the export, in tfs/net.py's file format (meta.npy is the generic one: tfs/circuit.py).
+import wire
+from wire import w_new, w_input, w_lin, w_reglu
+
+let TREAL = 16384      # real positions 0 .. TREAL - 1
+let GAP = 2097152                 # 2^21: >= 31 ln 2 in Q16, so iexp of -GAP is exactly 0
+let RG = GAP                      # recency, per position
+let MFLAG = 137438953472          # 2^37
+let MBOS = 68719476736            # 2^36
+let CPOS = GAP
+let DIG = ["a", "aa", "b", "bb", "c", "cc", "ss"]
+
+type Head = { name: str, q: list[list[(int, int)]], k: list[list[(int, int)]], v: list[int], out: list[int],
+    depth: int, tgt: list[int] }
+
+type G = {
+    c: wire.Circuit, heads: list[Head],
+    fnames: list[str], fwires: list[int], feat: map[str, int],
+    pnames: list[str], pwires: list[int], posf: map[str, int],
+    names: list[str], nwires: list[int],
+}
+
+fn offname(o: int) -> str {
+    if o < 0 { return format("m{}", -o) }
+    return str(o)
+}
+
+# A graph with token features code0 .. code{nb-1} then `flags`, and the position table for `offs` (0 is always there:
+# the abs heads' keys).
+fn new_graph(nb: int, flags: list[str], offs: list[int]) -> G {
+    let g = G {
+        c: w_new(), heads: [], fnames: [], fwires: [], feat: map_new(), pnames: [], pwires: [], posf: map_new(),
+        names: [], nwires: [],
+    }
+    for b in 0..nb { add_feat(g, format("code{}", b)) }
+    for f in flags { add_feat(g, f) }
+    for p in ["pos", "bos"] { add_pos(g, p) }
+    let os: list[int] = [0]
+    for o in offs {
+        if o != 0 { push(os, o) }
+    }
+    for o in os {
+        for d in DIG { add_pos(g, format("p{}_{}", offname(o), d)) }
+    }
+    return g
+}
+
+fn add_feat(g: G, n: str) {
+    let w = w_input(g.c)
+    push(g.fnames, n)
+    push(g.fwires, w)
+    map_set(g.feat, n, w)
+}
+
+fn add_pos(g: G, n: str) {
+    let w = w_input(g.c)
+    push(g.pnames, n)
+    push(g.pwires, w)
+    map_set(g.posf, n, w)
+}
+
+fn tok_feat(g: G, nm: str) -> int { return expect(map_get(g.feat, nm), nm) }
+fn pos_feat(g: G, nm: str) -> int { return expect(map_get(g.posf, nm), nm) }
+# position-table wires of offset o: (a, b, c, ss)
+fn off_digits(g: G, o: int) -> (int, int, int, int) {
+    let p = "p" + offname(o) + "_"
+    return (pos_feat(g, p + "a"), pos_feat(g, p + "b"), pos_feat(g, p + "c"), pos_feat(g, p + "ss"))
+}
+fn name(g: G, n: str, w: int) {
+    push(g.names, n)
+    push(g.nwires, w)
+}
+
+# ---- attention heads -------------------------------------------------------------------------------
+
+fn form_depth(c: wire.Circuit, fs: list[list[(int, int)]]) -> int {
+    let d = 0
+    for f in fs {
+        for t in f { d = max(d, c.depth[t.0]) }
+    }
+    return d
+}
+
+# A head: query / key coordinates are integer forms over wires (score units: the runner scales them for the softmax),
+# values are wires. Its outputs are new wires, one level deeper than everything it reads.
+fn head(g: G, nm: str, q: list[list[(int, int)]], k: list[list[(int, int)]], v: list[int], tgt: list[int]) -> list[int] {
+    let c = g.c
+    let d = max(form_depth(c, q), form_depth(c, k))
+    for w in v { d = max(d, c.depth[w]) }
+    d = d + 1
+    let out: list[int] = []
+    for _ in v {
+        let w = w_input(c)
+        c.depth[w] = d
+        push(out, w)
+    }
+    push(g.heads, Head { name: nm, q: q, k: k, v: v, out: out, depth: d, tgt: tgt })
+    return out
+}
+
+fn one() -> int { return 0 }      # wire 0 is the constant 1
+
+# The most recent position j <= t with flag_j = 1, else position 0 (BOS).
+fn latest(g: G, nm: str, flag: int, v: list[int]) -> list[int] {
+    let q = [[(one(), MFLAG)], [(one(), RG)], [(one(), MBOS)]]
+    let k = [[(flag, 1)], [(pos_feat(g, "pos"), 1)], [(pos_feat(g, "bos"), 1)]]
+    return head(g, nm, q, k, v, [])
+}
+
+# The position whose base-32 digits are (a, b, c); ss = a^2 + b^2 + c^2 as terms.
+fn abs_head(g: G, nm: str, a: int, b: int, cc: int, ss: list[(int, int)], v: list[int]) -> list[int] {
+    let sq: list[(int, int)] = []
+    for t in ss { push(sq, (t.0, -CPOS * t.1)) }
+    let q = [[(a, 2 * CPOS)], [(one(), -CPOS)], [(b, 2 * CPOS)], [(one(), -CPOS)], [(cc, 2 * CPOS)], [(one(), -CPOS)], sq]
+    let k: list[list[(int, int)]] = []
+    for d in ["a", "aa", "b", "bb", "c", "cc"] { push(k, [(pos_feat(g, "p0_" + d), 1)]) }
+    push(k, [(one(), 1)])
+    return head(g, nm, q, k, v, [a, b, cc])
+}
+
+# The latest record (a position with flag kname{i} = 1 for its index i) of the index whose one-hot is qoh.
+fn index_head(g: G, nm: str, qoh: list[int], kname: str, v: list[int]) -> list[int] {
+    let q: list[list[(int, int)]] = []
+    let k: list[list[(int, int)]] = []
+    for i in 0..len(qoh) {
+        push(q, [(qoh[i], MFLAG)])
+        push(k, [(tok_feat(g, format("{}{}", kname, i)), 1)])
+    }
+    push(q, [(one(), RG)])
+    push(k, [(pos_feat(g, "pos"), 1)])
+    push(q, [(one(), MBOS)])
+    push(k, [(pos_feat(g, "bos"), 1)])
+    return head(g, nm, q, k, v, [])
+}
+
+# ---- circuit helpers --------------------------------------------------------------------------------
+
+fn kr(c: wire.Circuit, k: int, terms: list[(int, int)], c0: int) -> int { return w_reglu(c, [], k, terms, c0) }
+
+# the four relus of [x == v]: [x == v] = r0 - r1 + r2 - r3 - 1
+fn eq_terms(c: wire.Circuit, x: int, v: int) -> list[(int, int)] {
+    return [(kr(c, 1, [(x, 1)], 1 - v), 1), (kr(c, 1, [(x, 1)], -v), -1),
+        (kr(c, 1, [(x, -1)], v + 1), 1), (kr(c, 1, [(x, -1)], v), -1)]
+}
+fn eqb(c: wire.Circuit, x: int, v: int) -> int { return w_lin(c, eq_terms(c, x, v), -1) }
+fn onehot(c: wire.Circuit, x: int, n: int) -> list[int] {
+    let out: list[int] = []
+    for v in 0..n { push(out, eqb(c, x, v)) }
+    return out
+}
+# [x >= t] for an integer threshold t
+fn geb(c: wire.Circuit, x: int, t: int) -> int {
+    return w_lin(c, [(kr(c, 1, [(x, 1)], 1 - t), 1), (kr(c, 1, [(x, 1)], -t), -1)], 0)
+}
+# k * [x >= t] (k on a constant cell: no ladder)
+fn geb_k(c: wire.Circuit, x: int, t: int, k: int) -> list[(int, int)] {
+    return [(kr(c, k, [(x, 1)], 1 - t), 1), (kr(c, k, [(x, 1)], -t), -1)]
+}
+# [x <= t]
+fn leb(c: wire.Circuit, x: int, t: int) -> int {
+    return w_lin(c, [(kr(c, 1, [(x, -1)], t + 1), 1), (kr(c, 1, [(x, -1)], t), -1)], 0)
+}
+# AND of 0/1 bits, `neg` negated: relu(sum pos - sum neg - n + 1)
+fn andb(c: wire.Circuit, pos: list[int], neg: list[int]) -> int {
+    let ts: list[(int, int)] = []
+    for w in pos { push(ts, (w, 1)) }
+    for w in neg { push(ts, (w, -1)) }
+    return w_reglu(c, [], 1, ts, 1 - len(pos))
+}
+# relu(bit + [x == v] - 1) = bit AND [x == v]
+fn and_eq(c: wire.Circuit, bit: int, eqt: list[(int, int)]) -> int {
+    let ts: list[(int, int)] = [(bit, 1)]
+    for t in eqt { push(ts, t) }
+    return w_reglu(c, [], 1, ts, -2)
+}
+# x * bit for a 0/1 bit (x any integer): x relu(bit)
+fn gate_by(c: wire.Circuit, x: int, bit: int) -> int { return w_reglu(c, [(x, 1)], 0, [(bit, 1)], 0) }
+
+fn odd(x: int) -> int {
+    if x % 2 != 0 { return 1 }
+    return 0
+}
+
+# bit b of token id `id` as +-1 (the code the readout decodes)
+fn code_bit(id: int, b: int) -> int {
+    let x = id
+    for _ in 0..b { x = (x - odd(x)) / 2 }
+    if odd(x) == 1 { return 1 }
+    return -1
+}
+
+fn bitlen_of(n: int) -> int {
+    let b = 0
+    let x = n
+    while x > 0 {
+        x = (x - odd(x)) / 2
+        b = b + 1
+    }
+    return b
+}
+
+# the output-code terms of forcing token `id` when `bit` is 1
+fn emit(ot: list[list[(int, int)]], bit: int, id: int) {
+    for b in 0..len(ot) { push(ot[b], (bit, code_bit(id, b))) }
+}
+
+# ---- export (tfs/net.py's files; meta.npy: n, nb, lo, S, heads, TREAL, GAP; tool.txt: the tool's kind) ----------
+
+fn flat_terms(rows: list[list[(int, int)]], hid: int, out: list[int]) {
+    for i in 0..len(rows) {
+        for t in rows[i] {
+            push(out, hid)
+            push(out, i)
+            push(out, t.0)
+            push(out, t.1)
+        }
+    }
+}
+
+type Built = { g: G, kind: str, nb: int, lo: int, S: int, out: list[int], fire: int, notfire: int }
+
+fn built(g: G, kind: str, nb: int, lo: int, S: int, out: list[int], fire: int, notfire: int) -> Built {
+    return Built { g: g, kind: kind, nb: nb, lo: lo, S: S, out: out, fire: fire, notfire: notfire }
+}
+
+fn n_ops(c: wire.Circuit) -> int {
+    let n = 0
+    for k in c.kind {
+        if k == 2 { n = n + 1 }
+    }
+    return n
+}
+
+fn summary(bt: Built) -> str {
+    return format("{} net: {} code bits, {} wires, {} ReGLU operations, {} attention heads, {} levels", bt.kind, bt.nb,
+        wire.w_size(bt.g.c), n_ops(bt.g.c), len(bt.g.heads), wire.w_layers(bt.g.c))
+}
+
+fn export(bt: Built, d: str) {
+    let g = bt.g
+    let c = g.c
+    let opw: list[int] = []
+    let opd: list[int] = []
+    let tl: list[int] = []
+    let tg: list[int] = []
+    let cw: list[int] = []
+    let cvv: list[int] = []
+    for w in 0..wire.w_size(c) {
+        if c.kind[w] == 1 {
+            push(cw, w)
+            push(cvv, c.cval[w])
+        }
+        if c.kind[w] == 2 {
+            let i = len(opw)
+            push(opw, w)
+            push(opd, c.depth[w])
+            for t in c.left[w] {
+                push(tl, i)
+                push(tl, t.0)
+                push(tl, t.1)
+            }
+            for t in c.gate[w] {
+                push(tg, i)
+                push(tg, t.0)
+                push(tg, t.1)
+            }
+        }
+    }
+    let hd: list[int] = []
+    let hq: list[int] = []
+    let hk: list[int] = []
+    let hv: list[int] = []
+    let ho: list[int] = []
+    let ht: list[int] = []
+    let hn: list[str] = []
+    for h in 0..len(g.heads) {
+        let x = g.heads[h]
+        push(hd, x.depth)
+        push(hn, x.name)
+        flat_terms(x.q, h, hq)
+        flat_terms(x.k, h, hk)
+        for i in 0..len(x.v) {
+            push(hv, h)
+            push(hv, i)
+            push(hv, x.v[i])
+            push(ho, h)
+            push(ho, i)
+            push(ho, x.out[i])
+        }
+        if len(x.tgt) == 3 {
+            push(ht, h)
+            for w in x.tgt { push(ht, w) }
+        }
+    }
+    save_ints(d + "/meta.npy", [wire.w_size(c), bt.nb, bt.lo, bt.S, len(g.heads), TREAL, GAP])
+    write_file(d + "/tool.txt", bt.kind + "\n")
+    write_file(d + "/feat.txt", join(g.fnames, "\n") + "\n")
+    save_ints(d + "/feat_w.npy", g.fwires)
+    write_file(d + "/posf.txt", join(g.pnames, "\n") + "\n")
+    save_ints(d + "/posf_w.npy", g.pwires)
+    save_ints(d + "/const_w.npy", cw)
+    save_ints(d + "/const_v.npy", cvv)
+    save_ints(d + "/op_w.npy", opw)
+    save_ints(d + "/op_d.npy", opd)
+    save_ints(d + "/op_l.npy", tl)
+    save_ints(d + "/op_g.npy", tg)
+    save_ints(d + "/head_d.npy", hd)
+    write_file(d + "/heads.txt", join(hn, "\n") + "\n")
+    save_ints(d + "/head_q.npy", hq)
+    save_ints(d + "/head_k.npy", hk)
+    save_ints(d + "/head_v.npy", hv)
+    save_ints(d + "/head_o.npy", ho)
+    save_ints(d + "/head_t.npy", ht)
+    let ow: list[int] = []
+    for w in bt.out { push(ow, w) }
+    push(ow, bt.notfire)
+    push(ow, bt.fire)
+    save_ints(d + "/out_w.npy", ow)
+    write_file(d + "/names.txt", join(g.names, "\n") + "\n")
+    save_ints(d + "/names_w.npy", g.nwires)
+}

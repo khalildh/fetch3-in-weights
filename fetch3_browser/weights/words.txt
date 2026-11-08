@@ -1,0 +1,1 @@
+a:110,and:103,city:113,cold:104,in:109,is:101,list:114,night:112,oslo:100,paris:105,rainy:102,sunny:106,the:107,weather:108,x1:111

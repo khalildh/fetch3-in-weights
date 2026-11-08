@@ -1,0 +1,393 @@
+# wire: turn integer programs into exact ternary-weight neural networks (docs/wire.md).
+#
+# A Circuit is a list of wires. A wire is a source (an input, or a constant cell) or one
+# operation, a ReGLU of two affine forms over earlier wires:
+#
+#     wire = (sum of +-1 * left wires) * relu(sum of +-1 * gate wires)
+#
+# Every coefficient is a trit. A plain affine sum is a ReGLU whose gate is the constant 1, a
+# constant term is a +1 on a constant cell, and a coefficient outside -1..1 is written in
+# balanced ternary over the ladder 3^k * x (`_tri`), so weights never leave {-1, 0, +1}.
+# All values are exact integers, so comparisons need no declared ranges: a >= b is
+# relu(a - b + 1) - relu(a - b) for every pair of integers.
+#
+# w_compile packs the operations into layers by depth: one layer is
+#     out = (Wl @ v) * relu(Wg @ v)          Wl, Wg: trit matrices over all wires
+# written back into the wire vector v. That is the shape of a GLU feed-forward block with ReLU.
+# w_ref evaluates the circuit one wire at a time on ints (the reference); w_run runs the net.
+
+type Circuit = {
+    kind: list[int],                 # 0 input, 1 constant cell, 2 operation
+    left: list[list[(int, int)]],    # operation terms (wire, trit), sorted by wire
+    gate: list[list[(int, int)]],
+    depth: list[int],
+    cval: list[int],                 # a constant cell's value
+    inputs: list[int],
+    consts: map[int, int],           # value -> constant cell
+    ladder: map[int, int],           # x * 64 + k -> the wire 3^k * x
+}
+
+type Layer = { wl: tensor[trit, 2], wg: tensor[trit, 2], idx: tensor[int64, 1] }
+
+type Net = {
+    n: int,
+    layers: list[Layer],
+    inputs: tensor[int64, 1],
+    cwires: tensor[int64, 1],
+    cvals: tensor[int64, 1],
+}
+
+fn w_new() -> Circuit {
+    let c = Circuit {
+        kind: [], left: [], gate: [], depth: [], cval: [], inputs: [],
+        consts: map_new(), ladder: map_new(),
+    }
+    w_const(c, 1)                    # wire 0: the constant 1, the gate of every plain sum
+    return c
+}
+
+fn _wire(c: Circuit, kind: int, left: list[(int, int)], gate: list[(int, int)], d: int, v: int) -> int {
+    let w = len(c.kind)
+    push(c.kind, kind)
+    push(c.left, left)
+    push(c.gate, gate)
+    push(c.depth, d)
+    push(c.cval, v)
+    return w
+}
+
+fn w_input(c: Circuit) -> int {
+    let w = _wire(c, 0, [], [], 0, 0)
+    push(c.inputs, w)
+    return w
+}
+
+fn w_const(c: Circuit, v: int) -> int {
+    return match map_get(c.consts, v) {
+        Some(w) => w
+        None => _new_const(c, v)
+    }
+}
+
+fn _new_const(c: Circuit, v: int) -> int {
+    let w = _wire(c, 1, [], [], 0, v)
+    map_set(c.consts, v, w)
+    return w
+}
+
+fn w_size(c: Circuit) -> int { return len(c.kind) }
+
+fn _depth_of(c: Circuit, terms: list[(int, int)]) -> int {
+    let d = 0
+    for t in terms {
+        d = max(d, c.depth[t.0])
+    }
+    return d
+}
+
+# One operation from normalized terms (distinct wires, trit coefficients).
+fn _op(c: Circuit, left: list[(int, int)], gate: list[(int, int)]) -> int {
+    for side in [left, gate] {
+        for t in side {
+            assert(t.1 >= -1 & t.1 <= 1 & t.1 != 0, "wire: coefficient is not a nonzero trit")
+        }
+    }
+    let d = 1 + max(_depth_of(c, left), _depth_of(c, gate))
+    return _wire(c, 2, left, gate, d, 0)
+}
+
+fn _cmp_wire(a: (int, int), b: (int, int)) -> trit { return a.0 <=> b.0 }
+
+# 3^k * x, built from 3^(k-1) * x plus two copies of it (all weights +1), cached.
+fn _tri(c: Circuit, x: int, k: int) -> int {
+    if k == 0 { return x }
+    let key = x * 64 + k
+    return match map_get(c.ladder, key) {
+        Some(w) => w
+        None => _new_tri(c, x, k, key)
+    }
+}
+
+fn _new_tri(c: Circuit, x: int, k: int, key: int) -> int {
+    let l = _tri(c, x, k - 1)
+    let one = [(0, 1)]
+    let c1 = _op(c, [(l, 1)], one)
+    let c2 = _op(c, [(l, 1)], one)
+    let w = _op(c, [(l, 1), (c1, 1), (c2, 1)], one)
+    map_set(c.ladder, key, w)
+    return w
+}
+
+# Sorted terms -> one term per wire, coefficients added.
+fn _merge_terms(ts: list[(int, int)]) -> list[(int, int)] {
+    let out: list[(int, int)] = []
+    for t in ts {
+        let m = len(out)
+        let same = false
+        if m > 0 { same = out[m - 1].0 == t.0 }
+        if same {
+            out[m - 1] = (t.0, out[m - 1].1 + t.1)
+        } else {
+            push(out, t)
+        }
+    }
+    return out
+}
+
+# Terms with any integer coefficients plus a constant -> distinct wires with trit coefficients.
+fn _norm(c: Circuit, terms: list[(int, int)], k: int) -> list[(int, int)] {
+    let ts: list[(int, int)] = []
+    for t in terms { push(ts, t) }
+    if k != 0 { push(ts, (w_const(c, k), 1)) }
+    sort_by(ts, _cmp_wire)
+    let merged = _merge_terms(ts)
+    # expand coefficients outside -1..1 in balanced ternary over the ladder
+    let out: list[(int, int)] = []
+    for t in merged {
+        let (w, a) = t
+        let k3 = 0
+        while a != 0 {
+            let r = a % 3            # balanced: -1, 0 or 1
+            if r != 0 { push(out, (_tri(c, w, k3), r)) }
+            a = (a - r) / 3
+            k3 = k3 + 1
+        }
+    }
+    sort_by(out, _cmp_wire)
+    # a ladder wire may coincide with a term already present: merge again (stays trit or
+    # cancels, since 3^k x and x are distinct wires unless k = 0)
+    let res = _merge_terms(out)
+    let fin: list[(int, int)] = []
+    for t in res {
+        assert(t.1 >= -1 & t.1 <= 1, "wire: merged coefficient left the trits")
+        if t.1 != 0 { push(fin, t) }
+    }
+    return fin
+}
+
+# ---- builders ---------------------------------------------------------------------------
+
+# (sum of coef * wire + lk) * relu(sum of coef * wire + gk)
+fn w_reglu(c: Circuit, lt: list[(int, int)], lk: int, gt_: list[(int, int)], gk: int) -> int {
+    return _op(c, _norm_fast(c, lt, lk), _norm_fast(c, gt_, gk))
+}
+
+# _norm without sorting or the ladder when the terms already are distinct wires with trit coefficients
+# (the common case; the result is the same set of terms)
+fn _norm_fast(c: Circuit, terms: list[(int, int)], k: int) -> list[(int, int)] {
+    let n = len(terms)
+    if n > 12 { return _norm(c, terms, k) }
+    for i in 0..n {
+        let t = terms[i]
+        if t.1 != 1 & t.1 != -1 { return _norm(c, terms, k) }
+        for j in 0..i {
+            if terms[j].0 == t.0 { return _norm(c, terms, k) }
+        }
+    }
+    if k == 0 { return terms }
+    let kw = w_const(c, k)
+    for t in terms {
+        if t.0 == kw { return _norm(c, terms, k) }
+    }
+    let out: list[(int, int)] = []
+    for t in terms { push(out, t) }
+    push(out, (kw, 1))
+    return out
+}
+
+# sum of coef * wire + k
+fn w_lin(c: Circuit, terms: list[(int, int)], k: int) -> int {
+    return w_reglu(c, terms, k, [], 1)
+}
+
+fn w_add(c: Circuit, a: int, b: int) -> int { return w_lin(c, [(a, 1), (b, 1)], 0) }
+fn w_sub(c: Circuit, a: int, b: int) -> int { return w_lin(c, [(a, 1), (b, -1)], 0) }
+fn w_neg(c: Circuit, a: int) -> int { return w_lin(c, [(a, -1)], 0) }
+fn w_scale(c: Circuit, a: int, k: int) -> int { return w_lin(c, [(a, k)], 0) }
+fn w_addk(c: Circuit, a: int, k: int) -> int { return w_lin(c, [(a, 1)], k) }
+
+fn w_sum(c: Circuit, ws: list[int]) -> int {
+    let ts: list[(int, int)] = []
+    for w in ws { push(ts, (w, 1)) }
+    return w_lin(c, ts, 0)
+}
+
+fn w_relu(c: Circuit, a: int) -> int { return w_reglu(c, [], 1, [(a, 1)], 0) }
+
+# a * b for any integers: a * relu(b) - a * relu(-b)
+fn w_mul(c: Circuit, a: int, b: int) -> int {
+    let p = w_reglu(c, [(a, 1)], 0, [(b, 1)], 0)
+    let n = w_reglu(c, [(a, 1)], 0, [(b, -1)], 0)
+    return w_sub(c, p, n)
+}
+
+# relu(a - b + k)
+fn _rd(c: Circuit, a: int, b: int, k: int) -> int {
+    return w_reglu(c, [], 1, [(a, 1), (b, -1)], k)
+}
+
+# Comparison bits (0 / 1), exact for all integers.
+fn w_ge(c: Circuit, a: int, b: int) -> int { return w_sub(c, _rd(c, a, b, 1), _rd(c, a, b, 0)) }
+fn w_gt(c: Circuit, a: int, b: int) -> int { return w_sub(c, _rd(c, a, b, 0), _rd(c, a, b, -1)) }
+fn w_le(c: Circuit, a: int, b: int) -> int { return w_ge(c, b, a) }
+fn w_lt(c: Circuit, a: int, b: int) -> int { return w_gt(c, b, a) }
+
+# [a == b] = [a >= b] + [b >= a] - 1
+fn w_eq(c: Circuit, a: int, b: int) -> int {
+    let ts = [(_rd(c, a, b, 1), 1), (_rd(c, a, b, 0), -1), (_rd(c, b, a, 1), 1), (_rd(c, b, a, 0), -1)]
+    return w_lin(c, ts, -1)
+}
+
+# a <=> b as an integer trit: clamp(a - b, -1, 1) = relu(d + 1) - relu(d - 1) - 1
+fn w_cmp(c: Circuit, a: int, b: int) -> int {
+    return w_lin(c, [(_rd(c, a, b, 1), 1), (_rd(c, a, b, -1), -1)], -1)
+}
+
+# cond (a 0/1 bit) ? on : off  =  off + (on - off) * relu(cond)
+fn w_select(c: Circuit, cond: int, on: int, off: int) -> int {
+    let g = w_reglu(c, [(on, 1), (off, -1)], 0, [(cond, 1)], 0)
+    return w_add(c, off, g)
+}
+
+fn w_min(c: Circuit, a: int, b: int) -> int { return w_sub(c, a, _rd(c, a, b, 0)) }
+fn w_max(c: Circuit, a: int, b: int) -> int { return w_add(c, b, _rd(c, a, b, 0)) }
+fn w_abs(c: Circuit, a: int) -> int {
+    return w_lin(c, [(w_relu(c, a), 1), (w_relu(c, w_neg(c, a)), 1)], 0)
+}
+
+# Kleene logic on trits (false -1, unknown 0, true +1): AND is min, OR is max, NOT negates.
+fn w_and(c: Circuit, a: int, b: int) -> int { return w_min(c, a, b) }
+fn w_or(c: Circuit, a: int, b: int) -> int { return w_max(c, a, b) }
+fn w_not(c: Circuit, a: int) -> int { return w_neg(c, a) }
+
+# The maximum of a nonempty list as a tree: log2(n) levels of w_max.
+fn w_max_list(c: Circuit, ws: list[int]) -> int {
+    let level = ws
+    while len(level) > 1 {
+        let next: list[int] = []
+        let i = 0
+        while i + 1 < len(level) {
+            push(next, w_max(c, level[i], level[i + 1]))
+            i = i + 2
+        }
+        if i < len(level) { push(next, level[i]) }
+        level = next
+    }
+    return level[0]
+}
+
+# table[i] for an integer wire i, 0 outside 0..len(table)-1. The one-hot bit of j is
+# R(j) - 2 R(j+1) + R(j+2) with R(m) = relu(i - m + 1); the -2 uses two copies of R(j+1), so
+# every weight stays a trit. Three layers whatever the table size.
+fn w_index(c: Circuit, i: int, table: list[int]) -> int {
+    let n = len(table)
+    let zero = w_const(c, 0)
+    let ra: list[int] = []
+    let rb: list[int] = []
+    for m in 0..n + 2 {
+        push(ra, _rd(c, i, zero, 1 - m))
+        push(rb, _rd(c, i, zero, 1 - m))
+    }
+    let parts: list[int] = []
+    for j in 0..n {
+        let g = [(ra[j], 1), (ra[j + 1], -1), (rb[j + 1], -1), (ra[j + 2], 1)]
+        push(parts, w_reglu(c, [(table[j], 1)], 0, g, 0))
+    }
+    return w_sum(c, parts)
+}
+
+# ---- evaluation ---------------------------------------------------------------------------
+
+fn _dot(vals: list[int], terms: list[(int, int)]) -> int {
+    let s = 0
+    for t in terms { s = s + t.1 * vals[t.0] }
+    return s
+}
+
+# The reference: every wire in build order, on ints.
+fn w_ref(c: Circuit, xs: list[int]) -> list[int] {
+    assert(len(xs) == len(c.inputs), "wire: wrong number of inputs")
+    let vals: list[int] = []
+    let next_in = 0
+    for w in 0..len(c.kind) {
+        let k = c.kind[w]
+        if k == 0 {
+            push(vals, xs[next_in])
+            next_in = next_in + 1
+        } else {
+            if k == 1 {
+                push(vals, c.cval[w])
+            } else {
+                push(vals, _dot(vals, c.left[w]) * max(_dot(vals, c.gate[w]), 0))
+            }
+        }
+    }
+    return vals
+}
+
+fn w_layers(c: Circuit) -> int {
+    let d = 0
+    for x in c.depth { d = max(d, x) }
+    return d
+}
+
+fn _row(n: int, terms: list[(int, int)]) -> list[int] {
+    let r: list[int] = []
+    for j in 0..n { push(r, 0) }
+    for t in terms { r[t.0] = t.1 }
+    return r
+}
+
+# Pack the operations into layers by depth: trit matrices over the whole wire vector.
+fn w_compile(c: Circuit) -> Net {
+    let n = len(c.kind)
+    let nl = w_layers(c)
+    let by: list[list[int]] = []
+    for d in 0..nl + 1 { push(by, []) }
+    let cw: list[int] = []
+    let cv: list[int] = []
+    for w in 0..n {
+        if c.kind[w] == 2 { push(by[c.depth[w]], w) }
+        if c.kind[w] == 1 {
+            push(cw, w)
+            push(cv, c.cval[w])
+        }
+    }
+    let layers: list[Layer] = []
+    for d in 1..nl + 1 {
+        let wl: list[list[int]] = []
+        let wg: list[list[int]] = []
+        for w in by[d] {
+            push(wl, _row(n, c.left[w]))
+            push(wg, _row(n, c.gate[w]))
+        }
+        push(layers, Layer { wl: tensor(wl, "trit"), wg: tensor(wg, "trit"), idx: tensor(by[d], "int64") })
+    }
+    return Net {
+        n: n, layers: layers, inputs: tensor(c.inputs, "int64"),
+        cwires: tensor(cw, "int64"), cvals: tensor(cv, "int64"),
+    }
+}
+
+# Run the net: per layer v[idx] = (Wl @ v) * relu(Wg @ v).
+fn w_run(net: Net, xs: list[int]) -> tensor[int64, 1] {
+    let v = zeros("int64", [net.n])
+    v = scatter_add(v, net.cwires, net.cvals)
+    if len(xs) > 0 { v = scatter_add(v, net.inputs, tensor(xs, "int64")) }
+    for l in net.layers {
+        let out = (l.wl @ v) * max(l.wg @ v, 0)
+        v = scatter_add(v, l.idx, out)
+    }
+    return v
+}
+
+# Size of the net: (layers, operations, nonzero weights).
+fn w_stats(net: Net) -> (int, int, int) {
+    let ops = 0
+    let nz = 0
+    for l in net.layers {
+        ops = ops + len(l.idx)
+        nz = nz + tsum(tsum(cast(abs(l.wl), "int64"))) + tsum(tsum(cast(abs(l.wg), "int64")))
+    }
+    return (len(net.layers), ops, nz)
+}

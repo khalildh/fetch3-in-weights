@@ -1,0 +1,1382 @@
+# Fetch v3 compiled into exact ternary-weight layers beside the integer hybrid (docs/tfs_fetch3.md): a light text-mode
+# browser. A superset of fetch v2's net (examples/wire/fetch2_net.tern: the allowlist, the HTTP request, the head,
+# redirects, framing), with the body read as HTML by a state machine whose state is the token each byte becomes:
+#   DATA   text bytes, words, entities, collapsed whitespace (<|s_skip|>), headings (<|x_head|>), block breaks ("\n")
+#   LT TAG <|s_lt|> at a tag's '<', <|s_tag|> inside it; DQ SQ: quoted attribute values (a '>' inside stays inside)
+#   HEQ HDQ HSQ HDF HSF: an <a href="..."> value (its '=', the value, its fragment); at the closing quote the link
+#          number <|ln_k|> if the value resolves to a URL (absolute, /root-relative, relative) of <= 64 characters
+#   CMT    a comment <!-- .. -->;  SCR STY: <script> / <style> contents, to their end tag
+# The state of the next byte is a function of the latest content token's state and the raw bytes around it (the
+# tape's window), so no recurrence through depth is needed. Links: <|follow|> <|ln_k|> -> the net looks link k up on
+# the current page (an index head), resolves it against the page's URL (carried from its <|h_send|>) and forces
+#   <|fetch|> URL <|fetch_end|>
+# which v2's machinery then checks against the allowlist and sends. Paging: a segment holds at most PAGE positions;
+# then <|h_more|> <|pg_a|> <|pg_b|> <|pg_c|> <|fetch_cut|> (the byte offset in base 32) and the model may write
+# <|next|>: the net reads the offset back and continues on the same tape (positions mapped through D, the
+# effective send position).
+#
+#     uv run python -m tern examples/wire/fetch3_net.tern LO3 LO2 FETCH_LO V ALLOW WORDS PART STARTS PAGE AGENT [OUT_DIR]
+#
+# PART: force (the browser) or mask (navigation masking: with STARTS, a model-written call may only spell a start
+# point and a follow may only name a link of the current page). The spec is tfs/fetch3.py.
+#
+# Silence (proved below when the file loads): every case bit is an AND over 0/1 bits with a phase bit among its
+# positive inputs (v2's phases, and: the token before is <|follow|>; the latest marker is a follow's forced
+# <|fetch|>; <|h_more|>; the token is <|next|>); where none holds the output code and the fire bit are exactly 0.
+import wire
+import toolnet
+from wire import w_lin, w_reglu
+from toolnet import tok_feat, pos_feat, latest, abs_head, kr, eqb, geb, leb, andb, gate_by
+
+let NEXTRA = 52
+let UMAX = 64
+let OMAX = 48
+let WMAX = 12
+let VB = 16384
+let W0 = -28                     # the tape's window: offsets W0 .. W1
+let W1 = 8
+let K = 32
+let NPG = 32
+let NST = 13
+let S3 = 81
+let CHARS = "abcdefghijklmnopqrstuvwxyz0123456789.-_~/:?=&%"
+let WORDCH = "abcdefghijklmnopqrstuvwxyz0123456789"
+# the URL characters (tfs/fetch2.py URLCH): v1's, upper case (so %XX escapes in either case), '#' (a fragment: never
+# sent, the request and the allowlist see the URL up to it)
+let UCH = "abcdefghijklmnopqrstuvwxyz0123456789.-_~/:?=&%ABCDEFGHIJKLMNOPQRSTUVWXYZ#"
+let HTTP1 = " HTTP/1.1\r\nHost: "
+# the request's last headers, with the User-Agent the export names (tfs/fetch2.py tail)
+fn tail_of(agent: str) -> str {
+    assert(len(agent) >= 1 & len(agent) <= 120, "fetch_net: a User-Agent of 1..120 characters")
+    for ch in agent { assert(ch >= 32 & ch <= 126, "fetch_net: a User-Agent of printable ASCII") }
+    return "\r\nUser-Agent: " + agent + "\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n"
+}
+let BLOCK = ["p", "br", "hr", "li", "ul", "ol", "dl", "dt", "dd", "tr", "div", "pre", "nav", "table", "title", "form",
+    "main", "body", "header", "footer", "section", "article", "aside", "h1", "h2", "h3", "h4", "h5", "h6"]
+# marker kinds (tfs/fetch2.py MK, tfs/fetch3.py MK3)
+let K_FETCH = 1
+let K_END = 2
+let K_CUT = 7
+let K_TCP = 8
+let K_TLS = 9
+let K_REQ = 10
+let K_SEND = 11
+let K_HEND = 12
+let K_CHUNK = 13
+let K_R1 = 14
+let K_FOL = 17
+let K_NEXT = 18
+let K_MORE = 19
+let K_DONE = 5
+let K_PCU = 20                   # compaction's markers (tfs/fetch3.py MK3)
+let K_PCL = 21
+let K_PCT = 22
+let K_PCE = 23
+# v3's ids from LO3 (tfs/fetch3.py NAMES)
+let I_SKIP = 0
+let I_LT = 1
+let I_TAG = 2
+let I_DQ = 3
+let I_SQ = 4
+let I_HEQ = 5
+let I_HDQ = 6
+let I_HSQ = 7
+let I_HDF = 8
+let I_HSF = 9
+let I_CMT = 10
+let I_SCR = 11
+let I_STY = 12
+let I_HEAD = 13
+let I_MORE = 14
+let I_PG = 15
+let I_LN = 49
+let I_PCU = 81                   # compaction (tfs/fetch3.py CNAMES): <|pc_url|> <|pc_links|> <|pc_text|> <|pc_end|>
+let I_PCL = 82
+let I_PCT = 83
+let I_PCE = 84
+let NLIFT = 14                   # rank's binary lifting: pages of < 2^14 text tokens (a tape holds <= 16,381 bytes)
+# states (tfs/fetch3.py ST_*)
+let ST_DATA = 1
+let ST_LT = 2
+let ST_TAG = 3
+let ST_DQ = 4
+let ST_SQ = 5
+let ST_HEQ = 6
+let ST_HDQ = 7
+let ST_HSQ = 8
+let ST_HDF = 9
+let ST_HSF = 10
+let ST_CMT = 11
+let ST_SCR = 12
+let ST_STY = 13
+
+fn wnames() -> list[str] {
+    let out: list[str] = []
+    for i in 0..W1 - W0 + 1 { push(out, format("W{}", i)) }
+    return out
+}
+
+fn flags() -> list[str] {
+    let out = ["MARK", "MK", "RFLAG", "RN", "USRC", "F_END", "F_SEND", "F_HEND", "F_CHUNK", "F_SCH", "F_TLS", "SKIP",
+        "ISTEXT", "TBYTE", "ISWC", "WCI", "ISSP", "ISWORD", "ISUC", "TAPE",
+        "ST", "ISST", "ISLN", "LNV", "PG", "F_FOL", "F_NEXT", "F_MORE", "ISHEAD", "F_FRAME", "F_LT", "F_HEQ", "F_HVAL",
+        "RAWB", "TEXTISH", "ISWH", "ISNL", "CHI", "F_CFRAME"]
+    for k in 1..K + 1 { push(out, format("LN{}", k)) }
+    for n in wnames() { push(out, n) }
+    return out
+}
+
+fn cidx(s: str, ch: int) -> int {
+    for i in 0..len(s) {
+        if s[i] == ch { return i }
+    }
+    return -1
+}
+
+# the text bytes that are not v1 URL characters (v2's <|b_XX|> tokens, in order)
+fn extra_bytes() -> list[int] {
+    let out: list[int] = []
+    for b in [9, 10, 13] {
+        if cidx(CHARS, b) < 0 { push(out, b) }
+    }
+    for b in 32..127 {
+        if cidx(CHARS, b) < 0 { push(out, b) }
+    }
+    return out
+}
+
+type Ctx = { g: toolnet.G, c: wire.Circuit, memo: map[str, int], lo: int, flo: int, lo3: int, xb: list[int] }
+
+fn tid(x: Ctx, b: int) -> int {
+    let i = cidx(CHARS, b)
+    if i >= 0 { return x.flo + 2 + i }
+    for j in 0..len(x.xb) {
+        if x.xb[j] == b { return x.lo + j }
+    }
+    panic(format("fetch3_net: no TEXT token for byte {}", b))
+    return -1
+}
+
+# [w == v], memoized per (wire, value)
+fn eqm(x: Ctx, w: int, v: int) -> int {
+    let key = format("{}:{}", w, v)
+    match map_get(x.memo, key) {
+        Some(r) => { return r }
+        None => {}
+    }
+    let r = eqb(x.c, w, v)
+    map_set(x.memo, key, r)
+    return r
+}
+
+# [w is ch], letters in either case
+fn ci(x: Ctx, w: int, ch: int) -> int {
+    if ch >= 97 & ch <= 122 { return w_lin(x.c, [(eqm(x, w, ch), 1), (eqm(x, w, ch - 32), 1)], 0) }
+    return eqm(x, w, ch)
+}
+
+fn ge_w(c: wire.Circuit, a: int, b: int) -> int { return geb(c, w_lin(c, [(a, 1), (b, -1)], 0), 0) }
+fn gt_w(c: wire.Circuit, a: int, b: int) -> int { return geb(c, w_lin(c, [(a, 1), (b, -1)], 0), 1) }
+fn or2(c: wire.Circuit, a: int, b: int) -> int { return geb(c, w_lin(c, [(a, 1), (b, 1)], 0), 1) }
+fn orn(c: wire.Circuit, ws: list[int]) -> int {
+    let ts: list[(int, int)] = []
+    for w in ws { push(ts, (w, 1)) }
+    return geb(c, w_lin(c, ts, 0), 1)
+}
+fn sumw(c: wire.Circuit, ws: list[int]) -> int {
+    let ts: list[(int, int)] = []
+    for w in ws { push(ts, (w, 1)) }
+    return w_lin(c, ts, 0)
+}
+fn notb(c: wire.Circuit, a: int) -> int { return w_lin(c, [(a, -1)], 1) }
+fn addk(c: wire.Circuit, a: int, k: int) -> int { return w_lin(c, [(a, 1)], k) }
+fn sub(c: wire.Circuit, a: int, b: int) -> int { return w_lin(c, [(a, 1), (b, -1)], 0) }
+# lo <= x <= hi
+fn inr(c: wire.Circuit, x: int, lo: int, hi: int) -> int { return andb(c, [geb(c, x, lo), leb(c, x, hi)], []) }
+# [lo <= t < hi] for wires
+fn seg(c: wire.Circuit, t: int, lo: int, hi: int) -> int { return andb(c, [ge_w(c, t, lo), gt_w(c, hi, t)], []) }
+# whitespace / a tag name's delimiter / a tag's first byte
+fn wsb(x: Ctx, w: int) -> int {
+    return w_lin(x.c, [(eqm(x, w, 9), 1), (eqm(x, w, 10), 1), (eqm(x, w, 13), 1), (eqm(x, w, 32), 1)], 0)
+}
+fn delim(x: Ctx, w: int) -> int { return w_lin(x.c, [(wsb(x, w), 1), (eqm(x, w, 47), 1), (eqm(x, w, 62), 1)], 0) }
+fn tagch(x: Ctx, w: int) -> int {
+    let c = x.c
+    return w_lin(c, [(inr(c, w, 97, 122), 1), (inr(c, w, 65, 90), 1), (eqm(x, w, 47), 1), (eqm(x, w, 33), 1),
+        (eqm(x, w, 63), 1)], 0)
+}
+
+# base-32 digits of 0 <= x < 32768 and the sum of their squares (terms); fetch_net.tern's
+fn digits(c: wire.Circuit, x: int) -> (int, int, int, list[(int, int)]) {
+    let au: list[(int, int)] = []
+    let rs: list[(int, int)] = [(x, 1)]
+    for m in 1..32 {
+        push(au, (kr(c, 1, [(x, 1)], 1 - 1024 * m), 1))
+        push(au, (kr(c, 1, [(x, 1)], -1024 * m), -1))
+        push(rs, (kr(c, 1024, [(x, 1)], 1 - 1024 * m), -1))
+        push(rs, (kr(c, 1024, [(x, 1)], -1024 * m), 1))
+    }
+    let a = w_lin(c, au, 0)
+    let r = w_lin(c, rs, 0)
+    let bu: list[(int, int)] = []
+    let cs: list[(int, int)] = [(r, 1)]
+    for m in 1..32 {
+        push(bu, (kr(c, 1, [(r, 1)], 1 - 32 * m), 1))
+        push(bu, (kr(c, 1, [(r, 1)], -32 * m), -1))
+        push(cs, (kr(c, 32, [(r, 1)], 1 - 32 * m), -1))
+        push(cs, (kr(c, 32, [(r, 1)], -32 * m), 1))
+    }
+    let b = w_lin(c, bu, 0)
+    let cc = w_lin(c, cs, 0)
+    let sq: list[(int, int)] = []
+    for d in [a, b, cc] { push(sq, (w_reglu(c, [(d, 1)], 0, [(d, 1)], 0), 1)) }
+    return (a, b, cc, sq)
+}
+
+# an abs head at a computed position
+fn read_at(g: toolnet.G, nm: str, at: int, v: list[int]) -> list[int] {
+    let (a, b, cc, ss) = digits(g.c, at)
+    return abs_head(g, nm, a, b, cc, ss, v)
+}
+
+fn check_origin(o: str) {
+    assert(len(o) <= OMAX, "fetch3_net: an origin longer than OMAX")
+    assert(starts_with(o, "https://") | starts_with(o, "http://"), "fetch3_net: an origin is not http(s)://")
+    for ch in o { assert(cidx(CHARS, ch) >= 0, "fetch3_net: an origin character outside CHARS") }
+}
+
+type Word = { w: str, id: int }
+
+fn parse_words(s: str) -> list[Word] {
+    let out: list[Word] = []
+    let t = trim(s)
+    if t == "-" | t == "" { return out }
+    for item in split(t, ",") {
+        let k = find(item, ":")
+        let w = substr(item, 0, k)
+        assert(len(w) >= 1 & len(w) <= WMAX, "fetch3_net: a word of 1..12 characters")
+        for ch in w { assert(cidx(WORDCH, ch) >= 0, "fetch3_net: a word character outside a-z 0-9") }
+        push(out, Word { w: w, id: unwrap(try_parse_int(substr(item, k + 1, len(item)))) })
+    }
+    return out
+}
+
+# a tag name at the bytes after this token's '<': r[i + j0 ..] spells nm (either case), then a delimiter
+fn name_at(x: Ctx, win: list[int], nm: str, j0: int) -> int {
+    let ps: list[int] = []
+    for t in 0..len(nm) { push(ps, ci(x, win[j0 + t - 1 - W0], nm[t])) }
+    push(ps, delim(x, win[j0 + len(nm) - 1 - W0]))
+    return andb(x.c, ps, [])
+}
+
+# A link's URL forced character by character (a follow's call, or an entry of the compact block's table): ft the
+# character's index, v = [Pfx, r_ins, Ltot, vstart, bsrc] the link's resolution (the page URL's first Pfx characters,
+# a '/' if r_ins, the href's characters from vstart); act gates every case. Returns the bit [ft == Ltot] (the end).
+fn url_chars(x: Ctx, ot: list[list[(int, int)]], cases: list[(str, int)], act: int, ft: int, v: list[int], byw: int,
+    nm: str) -> int {
+    let c = x.c
+    let inb = andb(c, [act, gt_w(c, v[0], ft)], [])
+    let insl = andb(c, [act, v[1], eqb(c, sub(c, ft, v[0]), 0)], [])
+    let inh = andb(c, [act, ge_w(c, ft, w_lin(c, [(v[0], 1), (v[1], 1)], 0)), gt_w(c, v[2], ft)], [])
+    # the page URL's characters from the context (the call or the Location), the href's from the tape (VB + its
+    # byte: page breaks between its bytes do not matter; the tape is the page's until the next send)
+    let prd = read_at(x.g, nm + "_rd", gate_by(c, w_lin(c, [(v[4], 1), (ft, 1)], 1), inb), [byw])[0]
+    let hsrc = gate_by(c, w_lin(c, [(v[3], 1), (ft, 1), (v[0], -1), (v[1], -1)], VB), inh)
+    let hrd = read_at(x.g, nm + "_tv", hsrc, [tok_feat(x.g, format("W{}", 0 - W0))])[0]
+    let frd = w_lin(c, [(gate_by(c, prd, inb), 1), (gate_by(c, hrd, inh), 1)], 0)
+    let finr = w_lin(c, [(inb, 1), (inh, 1)], 0)
+    for i in 0..len(UCH) {
+        let bit = andb(c, [finr, eqm(x, frd, UCH[i])], [])
+        toolnet.emit(ot, bit, tid(x, UCH[i]))
+        push(cases, (nm + "_c", bit))
+    }
+    toolnet.emit(ot, insl, x.flo + 2 + cidx(CHARS, 47))
+    push(cases, (nm + "_slash", insl))
+    return andb(c, [act, eqb(c, sub(c, ft, v[2]), 0)], [])
+}
+
+fn build(lo3: int, lo: int, flo: int, V: int, allow: list[str], words: list[Word], pagec: (int, logic),
+    agent: str) -> toolnet.Built {
+    let page = pagec.0
+    let compact = pagec.1
+    let TAIL = tail_of(agent)
+    let nb = toolnet.bitlen_of(V - 1)
+    let offs: list[int] = []
+    for k in 1..WMAX { push(offs, -k) }
+    for i in 1..UMAX + 1 { push(offs, i) }
+    let g = toolnet.new_graph(nb, flags(), offs)
+    let c = g.c
+    let x = Ctx { g: g, c: c, memo: map_new(), lo: lo, flo: flo, lo3: lo3, xb: extra_bytes() }
+    let pos = pos_feat(g, "pos")
+    let mkf = tok_feat(g, "MK")
+    let rawb = tok_feat(g, "RAWB")
+    let cur_end = tok_feat(g, "F_END")
+    let cur_hend = tok_feat(g, "F_HEND")
+    let cur_next = tok_feat(g, "F_NEXT")
+    let cur_mark = tok_feat(g, "MARK")
+
+    # ---- level 1: the latest markers; the tokens behind this one
+    let lm = latest(g, "last_mark", tok_feat(g, "MARK"), [mkf, pos])
+    let mk = lm[0]
+    let lmp = lm[1]
+    let d = latest(g, "last_send", tok_feat(g, "F_SEND"), [pos])[0]
+    let h = latest(g, "last_hend", tok_feat(g, "F_HEND"), [pos])[0]
+    let lsch = latest(g, "last_sch", tok_feat(g, "F_SCH"), [pos])
+    let e = latest(g, "last_end", tok_feat(g, "F_END"), [pos])[0]
+    let nred = latest(g, "last_redir", tok_feat(g, "RFLAG"), [tok_feat(g, "RN")])[0]
+    let lmore = latest(g, "last_more", tok_feat(g, "F_MORE"), [pos])[0]
+    let bwc: list[int] = [tok_feat(g, "ISWC")]          # the tokens q, q - 1, ..: a word character, its index, TEXT
+    let bwi: list[int] = [tok_feat(g, "WCI")]
+    let btx: list[int] = [tok_feat(g, "ISTEXT")]
+    for k in 1..WMAX {
+        let (a, b, cc, ss) = toolnet.off_digits(g, -k)
+        let r = abs_head(g, format("back{}", k), a, b, cc, [(ss, 1)],
+            [tok_feat(g, "ISWC"), tok_feat(g, "WCI"), tok_feat(g, "ISTEXT")])
+        push(bwc, r[0])
+        push(bwi, r[1])
+        push(btx, r[2])
+    }
+
+    # phases (exact: the latest-marker head reads a token feature)
+    let ph_head = eqm(x, mk, K_SEND)
+    let ph_body_raw = w_lin(c, [(eqm(x, mk, K_HEND), 1), (eqm(x, mk, K_CHUNK), 1), (eqm(x, mk, K_NEXT), 1)], 0)
+    let ph_req = w_lin(c, [(eqm(x, mk, K_TCP), 1), (eqm(x, mk, K_TLS), 1), (eqm(x, mk, K_REQ), 1)], 0)
+    let ph_redir = w_lin(c, [(eqm(x, mk, K_R1), 1), (eqm(x, mk, K_R1 + 1), 1), (eqm(x, mk, K_R1 + 2), 1)], 0)
+    let ph_more = eqm(x, mk, K_MORE)
+    let ph_fetch = eqm(x, mk, K_FETCH)
+
+    # ---- level 2: the previous token's marker; a resumed page (<|next|>): its offset, the effective send D
+    let (pa, pb, pc, pss) = toolnet.off_digits(g, -1)
+    let pm = abs_head(g, "prev_mark", pa, pb, pc, [(pss, 1)], [mk, lmp, tok_feat(g, "F_FOL")])
+    let p_open = eqm(x, pm[0], K_FETCH)
+    let prev_fol = pm[2]
+    let pgv: list[int] = []
+    for j in 0..3 { push(pgv, read_at(g, format("pg{}", j), addk(c, lmore, 1 + j), [tok_feat(g, "PG")])[0]) }
+    let valid_next = andb(c, [cur_next, eqm(x, pm[0], K_CUT), eqb(c, sub(c, pm[1], lmore), 4), gt_w(c, lmore, d)], [])
+    let i_res = w_lin(c, [(pgv[0], 1024), (pgv[1], 32), (pgv[2], 1)], 0)
+    let lres = latest(g, "last_resume", valid_next, [pos, w_lin(c, [(pos, 1), (i_res, -1)], 0)])
+    let res_here = gt_w(c, lres[0], d)
+    let D = w_lin(c, [(d, 1), (gate_by(c, sub(c, lres[1], d), res_here), 1)], 0)
+    let nxt_bad = andb(c, [cur_next], [valid_next])
+    let ph_body = andb(c, [ph_body_raw], [nxt_bad])
+    let segs = w_lin(c, [(h, 1), (gate_by(c, sub(c, lres[0], h), gt_w(c, lres[0], h)), 1)], 0)
+    let vpos = w_lin(c, [(pos, 1), (D, -1), (d, 1)], 0)
+
+    # ---- the tape (the copy head at VB + pos - D: this response's byte for the next token)
+    let src = w_lin(c, [(pos, 1), (D, -1)], VB)
+    let (sa, sb, sc, ssq) = digits(c, src)
+    let wv: list[int] = []
+    for n in wnames() { push(wv, tok_feat(g, n)) }
+    let win = abs_head(g, "copy", sa, sb, sc, ssq, wv)
+    let x0 = win[0 - W0]
+    let rb = win[-1 - W0]                                   # this token's own raw byte (in a response)
+
+    # per-position flags (keys of later heads), from this token's window
+    let inhead = andb(c, [ph_head, tok_feat(g, "SKIP")], [])
+    let byw = w_lin(c, [(tok_feat(g, "TBYTE"), 1), (gate_by(c, rb, rawb), 1)], 0)    # the byte this token stands for
+    let rbu: list[(int, int)] = []
+    for i in 0..len(UCH) { push(rbu, (eqm(x, rb, UCH[i]), 1)) }
+    let rbuc = w_lin(c, rbu, 0)
+    let isuc = w_lin(c, [(tok_feat(g, "ISUC"), 1), (andb(c, [rawb, rbuc], []), 1)], 0)
+    # Location: "\nlocation: " ending at this byte (the space)
+    let lt: list[int] = [inhead, eqm(x, rb, 32), eqm(x, win[-11 - W0], 10)]
+    let ln = "location:"
+    for j in 0..len(ln) { push(lt, ci(x, win[-10 + j - W0], ln[j])) }
+    let locf = andb(c, lt, [])
+    # Transfer-Encoding: chunked, ending at this byte (the CR)
+    let tt: list[int] = [inhead, eqm(x, rb, 13), eqm(x, win[-9 - W0], 32), eqm(x, win[-28 - W0], 10)]
+    let tn = "transfer-encoding:"
+    for j in 0..len(tn) { push(tt, ci(x, win[-27 + j - W0], tn[j])) }
+    let tv = "chunked"
+    for j in 0..len(tv) { push(tt, ci(x, win[-8 + j - W0], tv[j])) }
+    let tef = andb(c, tt, [])
+    # Content-Length: m = 1 .. 7 digits, ending at this byte (the CR)
+    let cn = "content-length:"
+    let clfs: list[int] = []
+    let clvs: list[int] = []
+    for m in 1..8 {
+        let pt: list[int] = [inhead, eqm(x, rb, 13), eqm(x, win[-2 - m - W0], 32), eqm(x, win[-18 - m - W0], 10)]
+        let vt: list[(int, int)] = []
+        let p10 = 1
+        for t in 0..m {
+            let dw = win[-2 - t - W0]
+            push(pt, inr(c, dw, 48, 57))
+            push(vt, (dw, p10))
+            p10 = p10 * 10
+        }
+        for j in 0..len(cn) { push(pt, ci(x, win[-17 - m + j - W0], cn[j])) }
+        let pmm = andb(c, pt, [])
+        push(clfs, pmm)
+        push(clvs, gate_by(c, w_lin(c, vt, -48 * (p10 - 1) / 9), pmm))
+    }
+    let clf = sumw(c, clfs)
+    # Content-Encoding (the request asks for identity): the name at its colon; at the byte ten after the colon (or the
+    # head's last byte) the line read back, refused unless it is exactly "\ncontent-encoding: identity\r" (any case)
+    let cen = "content-encoding:"
+    let cnm: list[int] = [inhead, eqm(x, win[-18 - W0], 10)]
+    for j in 0..len(cen) { push(cnm, ci(x, win[-17 + j - W0], cen[j])) }
+    let ce_name = andb(c, cnm, [])
+    let cel: list[int] = [w_lin(c, [(inhead, 1), (cur_hend, 1)], 0), eqm(x, win[-28 - W0], 10)]
+    for j in 0..len(cen) { push(cel, ci(x, win[-27 + j - W0], cen[j])) }
+    let ce_line = andb(c, cel, [])
+    let cid: list[int] = [ce_line, eqm(x, win[-10 - W0], 32), eqm(x, rb, 13)]
+    let idn = "identity"
+    for j in 0..len(idn) { push(cid, ci(x, win[-9 + j - W0], idn[j])) }
+    let ce_bad = andb(c, [ce_line], [andb(c, cid, [])])
+    let clv = sumw(c, clvs)
+    # the status line r[0 .. 12], at the byte r[12] (pos - d == 13)
+    let stf = andb(c, [inhead, eqb(c, w_lin(c, [(pos, 1), (d, -1)], 0), 13)], [])
+    let sl: list[int] = []
+    let pre = "HTTP/1."
+    for j in 0..len(pre) { push(sl, eqm(x, win[-13 + j - W0], pre[j])) }
+    push(sl, w_lin(c, [(eqm(x, win[-6 - W0], 49), 1), (eqm(x, win[-6 - W0], 48), 1)], 0))
+    push(sl, eqm(x, win[-5 - W0], 32))
+    push(sl, w_lin(c, [(eqm(x, rb, 32), 1), (eqm(x, rb, 13), 1)], 0))
+    let s200: list[int] = [eqm(x, win[-4 - W0], 50), eqm(x, win[-3 - W0], 48), eqm(x, win[-2 - W0], 48)]
+    let s3: list[int] = [eqm(x, win[-4 - W0], 51), eqm(x, win[-3 - W0], 48)]
+    let s3l: list[(int, int)] = []
+    for v in [49, 50, 51, 55, 56] { push(s3l, (eqm(x, win[-2 - W0], v), 1)) }
+    push(s3, w_lin(c, s3l, 0))
+    let st200 = andb(c, concat(sl, s200), [])
+    let stred = andb(c, concat(sl, s3), [])
+    # a chunk-size line's size at its <|h_chunk|> (this token's LF; CR before; up to 6 hex digits before that)
+    let hexs = "0123456789abcdefABCDEF"
+    let cnt: list[(int, int)] = []
+    let run: list[int] = []
+    let p16 = 1
+    for t in 0..6 {
+        let dw = win[-3 - t - W0]
+        let hv: list[(int, int)] = []
+        let hx: list[(int, int)] = []
+        for k in 0..len(hexs) {
+            let ch = hexs[k]
+            let v = k
+            if k >= 16 { v = k - 6 }
+            if v > 0 { push(hv, (eqm(x, dw, ch), v * p16)) }
+            push(hx, (eqm(x, dw, ch), 1))
+        }
+        push(run, w_lin(c, hx, 0))
+        push(cnt, (gate_by(c, w_lin(c, hv, 0), andb(c, run, [])), 1))
+        p16 = p16 * 16
+    }
+    let csize = w_lin(c, cnt, 0)
+    # a tag's kinds at its '<' (the bytes after it): closing, script, style, a, a heading, a block tag
+    let lt_close = eqm(x, x0, 47)
+    let lt_scr = name_at(x, win, "script", 1)
+    let lt_sty = name_at(x, win, "style", 1)
+    let lt_a = name_at(x, win, "a", 1)
+    let hds: list[int] = []
+    for k in 1..7 { push(hds, name_at(x, win, format("h{}", k), 1)) }
+    let lt_head = sumw(c, hds)
+    let bls: list[int] = []
+    for bn in BLOCK {
+        push(bls, name_at(x, win, bn, 1))
+        push(bls, andb(c, [lt_close, name_at(x, win, bn, 2)], []))
+    }
+    let lt_block = sumw(c, bls)
+    # an href's kinds at its '=': the value (after the quote) starts with http(s)://, '/', '//'
+    let hsv: list[int] = []
+    let hs0 = "https://"
+    for k in 0..8 { push(hsv, eqm(x, win[k + 1 - W0], hs0[k])) }
+    let hhv: list[int] = []
+    let hh0 = "http://"
+    for k in 0..7 { push(hhv, eqm(x, win[k + 1 - W0], hh0[k])) }
+    let h_abs = w_lin(c, [(andb(c, hsv, []), 1), (andb(c, hhv, []), 1)], 0)
+    let h_s1 = eqm(x, win[1 - W0], 47)
+    let h_s2 = eqm(x, win[2 - W0], 47)
+
+    # ---- level 3: the latest flags
+    let uv: list[int] = [pos, locf]
+    for i in 1..UMAX + 1 {
+        let (a, b, cc, ss) = toolnet.off_digits(g, i)
+        for w in [a, b, cc, ss] { push(uv, w) }
+    }
+    let lus = latest(g, "last_src", w_lin(c, [(tok_feat(g, "USRC"), 1), (locf, 1)], 0), uv)
+    let us_pos = lus[0]
+    let src_loc = lus[1]
+    let lst = latest(g, "last_status", stf, [pos, st200, stred])
+    let lcl = latest(g, "last_length", clf, [pos, clv])
+    let lte = latest(g, "last_te", tef, [pos])
+    let lcen = latest(g, "last_cename", ce_name, [pos])[0]
+    let lceb = latest(g, "last_cebad", ce_bad, [pos])[0]
+    let lch = latest(g, "last_chunk", tok_feat(g, "F_CHUNK"), [vpos, csize])
+    let lcs = latest(g, "last_cont", andb(c, [tok_feat(g, "ISST"), ph_body_raw], []), [pos, tok_feat(g, "ST")])
+    let llt = latest(g, "last_lt", tok_feat(g, "F_LT"), [pos, lt_close, lt_scr, lt_sty, lt_a, lt_head, lt_block])
+    # an href is measured in tape bytes (tb: the byte this token stands for), not in positions, so a value split by a
+    # page break (<|h_more|> .. <|next|> between its bytes) is still one value; chunk framing inside it is not
+    let tb = w_lin(c, [(pos, 1), (D, -1)], -1)
+    let lhq = latest(g, "last_heq", tok_feat(g, "F_HEQ"), [pos, h_abs, h_s1, h_s2, tb])
+    let lhv = latest(g, "last_hval", tok_feat(g, "F_HVAL"), [pos, tb])[1]
+    let lbad2 = latest(g, "last_bad", andb(c, [tok_feat(g, "F_HVAL")], [rbuc]), [pos, tb])
+    let lbad = lbad2[0]
+    let lfr = latest(g, "last_frame", tok_feat(g, "F_CFRAME"), [pos])[0]
+    let lln = latest(g, "last_ln", andb(c, [tok_feat(g, "ISLN"), ph_body_raw], []), [pos, tok_feat(g, "LNV")])
+    let ltx = latest(g, "last_text", andb(c, [tok_feat(g, "TEXTISH"), ph_body_raw], []),
+        [pos, tok_feat(g, "ISWH"), tok_feat(g, "ISNL")])
+
+    # ---- level 4: the URL's slots (the call's characters, or a Location value's bytes)
+    let sv: list[int] = []
+    let sc: list[int] = []
+    for j in 0..UMAX {
+        let r = abs_head(g, format("u{}", j), lus[2 + 4 * j], lus[3 + 4 * j], lus[4 + 4 * j], [(lus[5 + 4 * j], 1)],
+            [byw, isuc])
+        push(sv, r[0])
+        push(sc, r[1])
+    }
+
+    # ---- the URL: its length L, its checks, the allowlist, its parts
+    let lcall = w_lin(c, [(e, 1), (us_pos, -1)], -1)            # the call: <|fetch_end|> - <|fetch|> - 1
+    let fnc: list[int] = []                                      # Location: the first slot that is not a character
+    for j in 0..UMAX {
+        let before: list[int] = []
+        for t in 0..j { push(before, sc[t]) }
+        push(fnc, andb(c, before, [sc[j]]))
+    }
+    let llt2: list[(int, int)] = []
+    let crt: list[(int, int)] = []
+    for j in 0..UMAX {
+        if j > 0 { push(llt2, (fnc[j], j)) }
+        push(crt, (andb(c, [fnc[j], eqm(x, sv[j], 13)], []), 1))
+    }
+    let lloc = w_lin(c, llt2, 0)
+    let loc_term = w_lin(c, crt, 0)
+    let L = w_lin(c, [(gate_by(c, lcall, notb(c, src_loc)), 1), (gate_by(c, lloc, src_loc), 1)], 0)
+    # the fragment: Le, the length up to the first '#' (L without one); what is checked and sent
+    let hsh: list[int] = []
+    let fh: list[(int, int)] = []
+    let anyh: list[(int, int)] = []
+    for j in 0..UMAX {
+        let hj = andb(c, [eqm(x, sv[j], 35), geb(c, w_lin(c, [(L, 1)], -j), 1)], [])
+        let first = andb(c, [hj], hsh)
+        push(fh, (first, j))
+        push(anyh, (first, 1))
+        push(hsh, hj)
+    }
+    let Le = w_lin(c, [(w_lin(c, fh, 0), 1), (gate_by(c, L, notb(c, w_lin(c, anyh, 0))), 1)], 0)
+    let ccnt: list[(int, int)] = [(lcall, -1)]
+    for j in 0..UMAX { push(ccnt, (gate_by(c, sc[j], geb(c, lcall, j + 1)), 1)) }
+    let chars_ok = eqb(c, w_lin(c, ccnt, 0), 0)
+    let len_ok = andb(c, [geb(c, lcall, 1), leb(c, lcall, UMAX)], [])
+    let hsp: list[int] = [geb(c, Le, 8)]
+    for j in 0..len(hs0) { push(hsp, eqm(x, sv[j], hs0[j])) }
+    let is_https = andb(c, hsp, [])
+    let hp: list[int] = [geb(c, Le, 7)]
+    for j in 0..len(hh0) { push(hp, eqm(x, sv[j], hh0[j])) }
+    let is_http = andb(c, hp, [])
+    let scheme = w_lin(c, [(is_https, 1), (is_http, 1)], 0)
+    let al: list[(int, int)] = []
+    for o in allow {
+        check_origin(o)
+        let n = len(o)
+        let m: list[int] = [geb(c, Le, n)]
+        for j in 0..n { push(m, eqm(x, sv[j], o[j])) }
+        let term = w_lin(c, [(eqb(c, Le, n), 1), (andb(c, [geb(c, Le, n + 1), eqm(x, sv[n], 47)], []), 1)], 0)
+        push(m, term)
+        push(al, (andb(c, m, []), 1))
+    }
+    let allowed = w_lin(c, al, 0)
+    let valid_call = andb(c, [cur_end, p_open, len_ok, chars_ok, scheme], [src_loc])
+    let loc_here = gt_w(c, us_pos, d)
+    let valid_loc = andb(c, [src_loc, loc_here, loc_term, geb(c, lloc, 1), scheme], [])
+
+    # ---- the verdict at <|fetch_end|>
+    let c_err = andb(c, [cur_end], [valid_call])
+    let c_deny = andb(c, [valid_call], [allowed])
+    let c_go = andb(c, [valid_call, allowed], [])
+    let sch_go = w_lin(c, [(c_go, 1), (ph_redir, 1)], 0)
+    let c_tls = andb(c, [sch_go, is_https], [])
+    let c_tcp = andb(c, [sch_go], [is_https])
+
+    # ---- the request block: t = pos - K (K the latest scheme marker): the token at pos + 1 is the block's t-th
+    let s0 = w_lin(c, [(is_https, 1)], 7)
+    let fsl: list[int] = []
+    let fst: list[(int, int)] = []
+    for j in 8..UMAX {
+        let before: list[int] = []
+        for t in 8..j { push(before, eqm(x, sv[t], 47)) }
+        let f = andb(c, [eqm(x, sv[j], 47), geb(c, w_lin(c, [(Le, 1)], -j), 1)], before)
+        push(fsl, f)
+        push(fst, (f, j))
+    }
+    let anysl = sumw(c, fsl)
+    let he = w_lin(c, [(w_lin(c, fst, 0), 1), (gate_by(c, Le, notb(c, anysl)), 1)], 0)
+    let pcs: list[int] = []
+    for j in 8..UMAX { push(pcs, andb(c, [eqm(x, sv[j], 58), geb(c, w_lin(c, [(he, 1)], -j), 1)], [])) }
+    let hasport = orn(c, pcs)
+    let A = w_lin(c, [(he, 1), (s0, -1)], 0)
+    let DP = w_lin(c, [(hasport, -3), (andb(c, [is_https], [hasport]), 1)], 3)
+    let PL = w_lin(c, [(Le, 1), (he, -1)], 0)
+    let isroot = eqb(c, PL, 0)
+    let t = w_lin(c, [(pos, 1), (lsch[0], -1)], 0)
+    let b2 = w_lin(c, [(A, 1), (DP, 1)], 0)
+    let G = w_lin(c, [(b2, 1)], 1)
+    let P = w_lin(c, [(G, 1)], 4)
+    let Q = w_lin(c, [(P, 1), (PL, 1), (isroot, 1)], 0)
+    let R = w_lin(c, [(Q, 1)], len(HTTP1))
+    let X = w_lin(c, [(R, 1), (A, 1)], 0)
+    let Z = w_lin(c, [(X, 1)], len(TAIL))
+    let in_a1 = andb(c, [ph_req, gt_w(c, A, t)], [])
+    let in_port = andb(c, [ph_req, seg(c, t, A, b2)], [])
+    let at_req = andb(c, [ph_req, eqb(c, w_lin(c, [(t, 1), (b2, -1)], 0), 0)], [])
+    let in_path = andb(c, [ph_req, seg(c, t, P, Q)], [isroot])
+    let in_a2 = andb(c, [ph_req, seg(c, t, R, X)], [])
+    let at_send = andb(c, [ph_req, eqb(c, w_lin(c, [(t, 1), (Z, -1)], 0), 0)], [])
+    let idx = w_lin(c, [(gate_by(c, w_lin(c, [(s0, 1), (t, 1)], 0), in_a1), 1),
+        (gate_by(c, w_lin(c, [(he, 1), (t, 1), (P, -1)], 0), in_path), 1),
+        (gate_by(c, w_lin(c, [(s0, 1), (t, 1), (R, -1)], 0), in_a2), 1)], 0)
+    let (qa, qb, qc, qsq) = digits(c, w_lin(c, [(us_pos, 1), (idx, 1)], 1))
+    let rq = abs_head(g, "req_slot", qa, qb, qc, qsq, [byw])[0]
+    let in_slot = w_lin(c, [(in_a1, 1), (in_path, 1), (in_a2, 1)], 0)
+
+    # ---- the page's URL for its links: the request's URL source, carried from its <|h_send|>
+    # the last '/' at index >= 8 before any '?' (the directory of a relative link)
+    let qcnt: list[(int, int)] = []
+    let cands: list[int] = []
+    for j in 8..UMAX {
+        let inl = geb(c, w_lin(c, [(Le, 1)], -j), 1)
+        push(cands, andb(c, [eqm(x, sv[j], 47), inl], [geb(c, w_lin(c, concat(qcnt, []), 0), 1)]))
+        push(qcnt, (andb(c, [eqm(x, sv[j], 63), inl], []), 1))
+    }
+    let lsl: list[(int, int)] = []
+    let lsh: list[(int, int)] = []
+    for j in 0..len(cands) {
+        let later: list[(int, int)] = []
+        for jj in j + 1..len(cands) { push(later, (cands[jj], 1)) }
+        let bit = andb(c, [cands[j]], [geb(c, w_lin(c, later, 0), 1)])
+        push(lsl, (bit, j + 9))                                   # (index + 1) of the last slash
+        push(lsh, (bit, 1))
+    }
+    let lsb = latest(g, "last_sendb", tok_feat(g, "F_SEND"), [us_pos, Le, he, w_lin(c, lsh, 0), w_lin(c, lsl, 0)])
+    let bsrc = lsb[0]
+    let b_L = lsb[1]
+    let b_he = lsb[2]
+    let b_hasp = lsb[3]
+    let b_lsl1 = lsb[4]
+
+    let ot: list[list[(int, int)]] = []
+    for b in 0..nb { push(ot, []) }
+    let cases: list[(str, int)] = []
+    let skips: list[(int, int)] = []
+    let fails: list[(int, int)] = []
+    let cuts: list[(int, int)] = []
+    let dones: list[(int, int)] = []
+    # the request's slot bytes: the URL characters
+    for i in 0..len(UCH) {
+        let bit = andb(c, [in_slot, eqm(x, rq, UCH[i])], [])
+        toolnet.emit(ot, bit, tid(x, UCH[i]))
+        push(cases, ("req_c", bit))
+    }
+    # the request's constant bytes
+    let consts: list[(int, int, str)] = [(andb(c, [in_port], [is_https]), A, ":80"),
+        (andb(c, [in_port, is_https], []), A, ":443"),
+        (andb(c, [ph_req, seg(c, t, G, P)], []), G, "GET "),
+        (andb(c, [ph_req, isroot, eqb(c, w_lin(c, [(t, 1), (P, -1)], 0), 0)], []), P, "/"),
+        (andb(c, [ph_req, seg(c, t, Q, R)], []), Q, HTTP1),
+        (andb(c, [ph_req, seg(c, t, X, Z)], []), X, TAIL)]
+    for cs in consts {
+        let (sg, st, s) = cs
+        let u = w_lin(c, [(t, 1), (st, -1)], 0)
+        for m in 0..len(s) {
+            let bit = andb(c, [sg, eqm(x, u, m)], [])
+            toolnet.emit(ot, bit, tid(x, s[m]))
+            push(cases, ("req_k", bit))
+        }
+    }
+    toolnet.emit(ot, at_req, lo + NEXTRA + 2)
+    toolnet.emit(ot, at_send, lo + NEXTRA + 3)
+    toolnet.emit(ot, c_err, flo + 50)
+    toolnet.emit(ot, c_deny, flo + 51)
+    toolnet.emit(ot, c_tcp, lo + NEXTRA)
+    toolnet.emit(ot, c_tls, lo + NEXTRA + 1)
+
+    # ---- the head: <|h_skip|> per byte, <|h_hend|> on CRLF CRLF, a missing head fails
+    let isterm = geb(c, x0, 256)
+    let t_cut = eqm(x, x0, 257)
+    let crlf2 = andb(c, [eqm(x, win[-3 - W0], 13), eqm(x, win[-2 - W0], 10), eqm(x, rb, 13), eqm(x, x0, 10)], [])
+    let c_hend = andb(c, [ph_head, crlf2], [])
+    let c_hfail0 = andb(c, [ph_head, isterm], [])
+    push(skips, (andb(c, [ph_head], [isterm, crlf2]), 1))
+    push(fails, (c_hfail0, 1))
+
+    # ---- at <|h_hend|>: the status
+    # a refused Content-Encoding: one refused line in this head, or a name too close to the head's end for its value
+    let ce_near = leb(c, w_lin(c, [(pos, 1), (lcen, -1)], 0), 9)
+    let ce_ref = or2(c, gt_w(c, lceb, d), andb(c, [gt_w(c, lcen, d), ce_near], []))
+    let st_here = gt_w(c, lst[0], d)
+    let s200b = andb(c, [st_here, lst[1]], [ce_ref])
+    let sred = andb(c, [st_here, lst[2]], [])
+    let redir_ok = andb(c, [sred, valid_loc, allowed, leb(c, nred, 2)], [ce_ref])
+    let rds: list[int] = []
+    for k in 0..3 {
+        let bit = andb(c, [cur_hend, redir_ok, eqm(x, nred, k)], [])
+        toolnet.emit(ot, bit, lo + NEXTRA + 7 + k)
+        push(rds, bit)
+    }
+    push(fails, (andb(c, [cur_hend], [s200b, redir_ok]), 1))
+    let body_ok = andb(c, [ph_body], [andb(c, [cur_hend], [s200b])])
+
+    # ---- the body's framing (positions in the tape's coordinates: vpos = pos - D + d)
+    let chunked = andb(c, [body_ok, gt_w(c, lte[0], d)], [])
+    let haslen = gt_w(c, lcl[0], d)
+    let is_len = andb(c, [body_ok, haslen], [chunked])
+    let is_eof = andb(c, [body_ok], [haslen, chunked])
+    let cl = lcl[1]
+    let o = w_lin(c, [(vpos, 1), (h, -1)], 0)
+    let ldone = andb(c, [is_len, eqb(c, w_lin(c, [(o, 1), (cl, -1)], 0), 0)], [])
+    let lterm = andb(c, [is_len, isterm], [ldone])
+    push(cuts, (andb(c, [lterm, t_cut], []), 1))
+    push(fails, (andb(c, [lterm], [t_cut]), 1))
+    let lcont = andb(c, [is_len], [ldone, isterm])
+    let llast = eqb(c, w_lin(c, [(o, 1), (cl, -1)], 0), -1)
+    push(dones, (ldone, 1))
+    push(dones, (andb(c, [is_eof, eqm(x, x0, 256)], []), 1))
+    push(cuts, (andb(c, [is_eof, t_cut], []), 1))
+    push(fails, (andb(c, [is_eof, geb(c, x0, 258)], []), 1))
+    let econt = andb(c, [is_eof], [isterm])
+    let k = lch[0]
+    let n = lch[1]
+    let hasch = andb(c, [chunked, gt_w(c, k, h)], [])
+    let q1 = w_lin(c, [(vpos, 1)], 1)
+    let kn = w_lin(c, [(k, 1), (n, 1)], 0)
+    let z = eqb(c, n, 0)
+    let indata = andb(c, [hasch, ge_w(c, kn, q1)], [])
+    push(cuts, (andb(c, [indata, t_cut], []), 1))
+    push(fails, (andb(c, [indata, isterm], [t_cut]), 1))
+    let chcont = andb(c, [indata], [isterm])
+    let chlast = eqb(c, w_lin(c, [(kn, 1), (q1, -1)], 0), 0)
+    let exps: list[(int, int, int)] = [
+        (andb(c, [hasch, z, eqb(c, w_lin(c, [(q1, 1), (k, -1)], -1), 0)], []), 13, 0),
+        (andb(c, [hasch, z, geb(c, w_lin(c, [(q1, 1), (k, -1)], -2), 0)], []), 10, 1),
+        (andb(c, [hasch, eqb(c, w_lin(c, [(q1, 1), (kn, -1)], -1), 0)], [z]), 13, 0),
+        (andb(c, [hasch, eqb(c, w_lin(c, [(q1, 1), (kn, -1)], -2), 0)], [z]), 10, 0)]
+    for ex in exps {
+        let (bit, v, then) = ex
+        let okb = andb(c, [bit, eqm(x, x0, v)], [])
+        if then == 0 {
+            push(skips, (okb, 1))
+        } else {
+            push(dones, (okb, 1))
+        }
+        push(cuts, (andb(c, [bit, t_cut], []), 1))
+        push(fails, (andb(c, [bit], [eqm(x, x0, v), t_cut]), 1))
+    }
+    let s = w_lin(c, [(h, 1), (gate_by(c, w_lin(c, [(kn, 1), (h, -1)], 2), hasch), 1)], 1)
+    let reg = w_lin(c, [(andb(c, [chunked], [hasch]), 1), (andb(c, [hasch, ge_w(c, q1, w_lin(c, [(kn, 1)], 3))], [z]), 1)], 0)
+    let u = w_lin(c, [(q1, 1), (s, -1)], 0)
+    let prevcr = andb(c, [geb(c, u, 1), eqm(x, rb, 13)], [])
+    let hx: list[(int, int)] = []
+    for i in 0..len(hexs) { push(hx, (eqm(x, x0, hexs[i]), 1)) }
+    let hex0 = w_lin(c, hx, 0)
+    push(cuts, (andb(c, [reg, t_cut], []), 1))
+    push(fails, (andb(c, [reg, isterm], [t_cut]), 1))
+    let r_lf = andb(c, [reg, prevcr, eqm(x, x0, 10)], [])
+    push(fails, (andb(c, [reg, prevcr], [eqm(x, x0, 10), isterm]), 1))
+    let r_hex = andb(c, [reg, hex0, leb(c, u, 5)], [prevcr])
+    let r_cr = andb(c, [reg, eqm(x, x0, 13), geb(c, u, 1)], [prevcr])
+    push(skips, (r_hex, 1))
+    push(skips, (r_cr, 1))
+    push(fails, (andb(c, [reg], [isterm, prevcr, r_hex, r_cr]), 1))
+    toolnet.emit(ot, r_lf, lo + NEXTRA + 6)
+
+    # ---- a content byte x0: paging, then the HTML state machine
+    let cont = w_lin(c, [(lcont, 1), (econt, 1), (chcont, 1)], 0)
+    let last = w_lin(c, [(andb(c, [lcont, llast], []), 1), (andb(c, [chcont, chlast], []), 1)], 0)
+    let over = geb(c, w_lin(c, [(pos, 1), (segs, -1)], 0), page)
+    let c_more = andb(c, [cont, over], [])
+    toolnet.emit(ot, c_more, lo3 + I_MORE)
+    push(cases, ("more", c_more))
+    let cb = andb(c, [cont], [over])
+    let here = gt_w(c, lcs[0], h)
+    let S = w_lin(c, [(gate_by(c, lcs[1], here), 1), (notb(c, here), 1)], 0)      # DATA (1) on a page's first byte
+    let sts: list[int] = [0]
+    for v in 1..NST + 1 { push(sts, andb(c, [cb, eqm(x, S, v)], [])) }
+    let is60 = eqm(x, x0, 60)
+    let is62 = eqm(x, x0, 62)
+    let is34 = eqm(x, x0, 34)
+    let is39 = eqm(x, x0, 39)
+    let is35 = eqm(x, x0, 35)
+    let is61 = eqm(x, x0, 61)
+    let prevtxt = gt_w(c, ltx[0], h)
+    let lwhite = ltx[1]
+    let lnl = ltx[2]
+    let skip3 = lo3 + I_SKIP
+    let tag3 = lo3 + I_TAG
+
+    # DATA: a tag or comment opens; v2's text (entities, whitespace, words)
+    let cD = sts[ST_DATA]
+    let tsr = andb(c, [is60, tagch(x, win[1 - W0])], [])
+    let cmtm = andb(c, [eqm(x, win[1 - W0], 33), eqm(x, win[2 - W0], 45), eqm(x, win[3 - W0], 45)], [])
+    let d_lt = andb(c, [cD, tsr], [cmtm])
+    let d_cmt = andb(c, [cD, tsr, cmtm], [])
+    toolnet.emit(ot, d_lt, lo3 + I_LT)
+    toolnet.emit(ot, d_cmt, lo3 + I_CMT)
+    push(cases, ("d_lt", d_lt))
+    push(cases, ("d_cmt", d_cmt))
+    let ents: list[(str, int)] = [("&amp;", 38), ("&lt;", 60), ("&gt;", 62), ("&quot;", 34), ("&#39;", 39),
+        ("&apos;", 39), ("&nbsp;", 32)]
+    let tails: list[int] = []
+    for m in 1..6 {
+        for en in ents {
+            let s1 = en.0
+            if len(s1) > m {
+                let sp: list[int] = [btx[m - 1]]
+                for j in 0..len(s1) { push(sp, eqm(x, win[-m + j - W0], s1[j])) }
+                push(tails, andb(c, sp, []))
+            }
+        }
+    }
+    let ent_tail = orn(c, tails)
+    let heads: list[int] = []
+    for en in ents {
+        let s1 = en.0
+        let sp: list[int] = []
+        for j in 0..len(s1) { push(sp, eqm(x, win[j - W0], s1[j])) }
+        let hb = andb(c, sp, [])
+        push(heads, hb)
+        let bit = andb(c, [cD, hb], [tsr, ent_tail])
+        toolnet.emit(ot, bit, tid(x, en.1))
+        push(cases, ("ent", bit))
+    }
+    let anyhead = sumw(c, heads)
+    let ws = wsb(x, x0)
+    let ws_keep = andb(c, [cD, ws, prevtxt], [tsr, ent_tail, anyhead, lwhite])
+    toolnet.emit(ot, ws_keep, tid(x, 32))
+    push(cases, ("ws", ws_keep))
+    let sskip: list[int] = []
+    push(sskip, andb(c, [cD, ent_tail], [tsr]))
+    push(sskip, w_lin(c, [(andb(c, [cD, ws], [tsr, ent_tail, anyhead]), 1), (ws_keep, -1)], 0))
+    let istx = inr(c, x0, 33, 126)
+    let wc1 = w_lin(c, [(inr(c, win[1 - W0], 48, 57), 1), (inr(c, win[1 - W0], 97, 122), 1)], 0)
+    let wend = or2(c, last, notb(c, wc1))
+    let wmemo: map[str, int] = map_new()
+    let wbits: list[(int, int)] = []
+    for wd in words {
+        let w = wd.w
+        let nw = len(w)
+        let pt: list[int] = [cD, wend, eqm(x, x0, w[nw - 1])]
+        for kk in 0..nw - 1 {
+            let ch = w[nw - 2 - kk]
+            let key = format("{}:{}", kk, ch)
+            let cw = match map_get(wmemo, key) {
+                Some(r) => r
+                None => andb(c, [bwc[kk], eqm(x, bwi[kk], cidx(WORDCH, ch))], [])
+            }
+            map_set(wmemo, key, cw)
+            push(pt, cw)
+        }
+        let neg: list[int] = [tsr, ent_tail]
+        if nw - 1 < WMAX { push(neg, bwc[nw - 1]) }
+        let bit = andb(c, pt, neg)
+        toolnet.emit(ot, bit, wd.id)
+        push(wbits, (bit, 1))
+        push(cases, ("word", bit))
+    }
+    let anyword = w_lin(c, wbits, 0)
+    for b in 33..127 {
+        let bit = andb(c, [cD, istx, eqm(x, x0, b)], [tsr, ent_tail, anyhead, anyword])
+        toolnet.emit(ot, bit, tid(x, b))
+        push(cases, ("text", bit))
+    }
+    push(sskip, andb(c, [cD], [tsr, ent_tail, anyhead, ws, istx]))
+
+    # LT / TAG: '>' closes, quotes open a value, href= in an <a> tag opens a link's value
+    let cT = andb(c, [w_lin(c, [(sts[ST_LT], 1), (sts[ST_TAG], 1)], 0)], [])
+    let hrefm: list[int] = [cT, is61, llt[4], wsb(x, win[-5 - W0])]
+    let hr = "href"
+    for j in 0..4 { push(hrefm, ci(x, win[-4 + j - W0], hr[j])) }
+    let t_heq = andb(c, hrefm, [llt[1], gt_w(c, lhq[0], llt[0])])
+    let t_dq = andb(c, [cT, is34], [])
+    let t_sq = andb(c, [cT, is39], [])
+    let t_tag = andb(c, [cT], [is62, is34, is39, t_heq])
+    # HEQ (the '='): a quote opens the link's value
+    let cE = sts[ST_HEQ]
+    let e_hdq = andb(c, [cE, is34], [])
+    let e_hsq = andb(c, [cE, is39], [])
+    let e_tag = andb(c, [cE], [is34, is39, is62])
+    # a tag's '>': by the kinds of its '<'
+    let cl0 = w_lin(c, [(andb(c, [cT, is62], []), 1), (andb(c, [cE, is62], []), 1)], 0)
+    let cl_scr = andb(c, [cl0, llt[2]], [])
+    let cl_sty = andb(c, [cl0, llt[3]], [])
+    let cl_hd = andb(c, [cl0, llt[5]], [])
+    let cl_nl = andb(c, [cl0, llt[6], prevtxt], [llt[5], lnl])
+    let cl_skip = w_lin(c, [(cl0, 1), (cl_scr, -1), (cl_sty, -1), (cl_hd, -1), (cl_nl, -1)], 0)
+    # quoted values
+    let q_dq = andb(c, [sts[ST_DQ], is34], [])
+    let q_dqs = andb(c, [sts[ST_DQ]], [is34])
+    let q_sq = andb(c, [sts[ST_SQ], is39], [])
+    let q_sqs = andb(c, [sts[ST_SQ]], [is39])
+    # a link's value: its fragment, its closing quote
+    let v_close = w_lin(c, [(andb(c, [sts[ST_HDQ], is34], []), 1), (andb(c, [sts[ST_HDF], is34], []), 1),
+        (andb(c, [sts[ST_HSQ], is39], []), 1), (andb(c, [sts[ST_HSF], is39], []), 1)], 0)
+    let v_hdf = andb(c, [sts[ST_HDQ], is35], [is34])
+    let v_hdq = andb(c, [sts[ST_HDQ]], [is34, is35])
+    let v_hdfs = andb(c, [sts[ST_HDF]], [is34])
+    let v_hsf = andb(c, [sts[ST_HSQ], is35], [is39])
+    let v_hsq = andb(c, [sts[ST_HSQ]], [is39, is35])
+    let v_hsfs = andb(c, [sts[ST_HSF]], [is39])
+    # the link: the value's length, its kind, its resolution against the page's URL
+    let hq = lhq[0]
+    let vstart = addk(c, lhq[4], 2)                   # the value's first byte (tape index)
+    let Lh = w_lin(c, [(lhv, 1), (lhq[4], -1)], -1)
+    let k_root = andb(c, [lhq[2]], [lhq[1], lhq[3]])
+    let k_proto = andb(c, [lhq[2], lhq[3]], [lhq[1]])
+    let k_rel = andb(c, [], [lhq[1], lhq[2]])
+    let r_dir = andb(c, [k_rel, b_hasp], [])
+    let r_ins = andb(c, [k_rel], [b_hasp])
+    let Pfx = w_lin(c, [(gate_by(c, b_he, k_root), 1), (gate_by(c, b_lsl1, r_dir), 1), (gate_by(c, b_L, r_ins), 1)], 0)
+    let Ltot = w_lin(c, [(Pfx, 1), (r_ins, 1), (Lh, 1)], 0)
+    let count = gate_by(c, lln[1], gt_w(c, lln[0], h))
+    let linkable = andb(c, [geb(c, Lh, 1), leb(c, Ltot, UMAX), leb(c, count, K - 1)],
+        [gt_w(c, lfr, hq), andb(c, [gt_w(c, lbad, hq), ge_w(c, lbad2[1], vstart)], []), k_proto])
+    for kk in 0..K {
+        let bit = andb(c, [v_close, linkable, eqm(x, count, kk)], [])
+        toolnet.emit(ot, bit, lo3 + I_LN + kk)
+        push(cases, ("link", bit))
+    }
+    let v_tag = andb(c, [v_close], [linkable])
+    # comments, script, style
+    let cmt_end = andb(c, [sts[ST_CMT], is62, eqm(x, rb, 45), eqm(x, win[-2 - W0], 45)], [])
+    let cmt_in = andb(c, [sts[ST_CMT]], [cmt_end])
+    let rawend: list[int] = []
+    let rawin: list[int] = []
+    for rs in [("/script", ST_SCR, I_SCR), ("/style", ST_STY, I_STY)] {
+        let (nm, stv, iv) = rs
+        let ps: list[int] = [sts[stv], is60]
+        for j in 0..len(nm) { push(ps, ci(x, win[1 + j - W0], nm[j])) }
+        push(ps, delim(x, win[1 + len(nm) - W0]))
+        let eb = andb(c, ps, [])
+        push(rawend, eb)
+        let ib = andb(c, [sts[stv]], [eb])
+        toolnet.emit(ot, ib, lo3 + iv)
+        push(cases, ("raw", ib))
+    }
+    let tagout: list[(str, int, int)] = [("t_heq", t_heq, I_HEQ), ("t_dq", t_dq, I_DQ), ("t_sq", t_sq, I_SQ),
+        ("t_tag", t_tag, I_TAG), ("e_hdq", e_hdq, I_HDQ), ("e_hsq", e_hsq, I_HSQ), ("e_tag", e_tag, I_TAG),
+        ("cl_scr", cl_scr, I_SCR), ("cl_sty", cl_sty, I_STY), ("cl_hd", cl_hd, I_HEAD), ("cl_skip", cl_skip, I_SKIP),
+        ("q_dq", q_dq, I_TAG), ("q_dqs", q_dqs, I_DQ), ("q_sq", q_sq, I_TAG), ("q_sqs", q_sqs, I_SQ),
+        ("v_hdf", v_hdf, I_HDF), ("v_hdq", v_hdq, I_HDQ), ("v_hdfs", v_hdfs, I_HDF), ("v_hsf", v_hsf, I_HSF),
+        ("v_hsq", v_hsq, I_HSQ), ("v_hsfs", v_hsfs, I_HSF), ("v_tag", v_tag, I_TAG), ("cmt_end", cmt_end, I_SKIP),
+        ("cmt_in", cmt_in, I_CMT), ("raw_end_scr", rawend[0], I_LT), ("raw_end_sty", rawend[1], I_LT)]
+    for to in tagout {
+        toolnet.emit(ot, to.1, lo3 + to.2)
+        push(cases, (to.0, to.1))
+    }
+    toolnet.emit(ot, cl_nl, tid(x, 10))
+    push(cases, ("cl_nl", cl_nl))
+    for sk in sskip {
+        toolnet.emit(ot, sk, skip3)
+        push(cases, ("s_skip", sk))
+    }
+
+    # ---- <|follow|> <|ln_k|>: link k of the current page, its URL forced as a call. Without compaction the link is
+    # looked up in the page's bytes (the latest body <|ln_k|>); with it, in the compact block's link table (below)
+    let fv = andb(c, [prev_fol], [cur_mark])
+    let fol_out = fv
+    let lq: list[list[(int, int)]] = []
+    let lk: list[list[(int, int)]] = []
+    let keyany: list[(int, int)] = []
+    for kk in 1..K + 1 {
+        let kw = andb(c, [tok_feat(g, format("LN{}", kk)), ph_body_raw], [])
+        push(lq, [(tok_feat(g, format("LN{}", kk)), toolnet.MFLAG)])
+        push(lk, [(kw, 1)])
+        push(keyany, (kw, 1))
+    }
+    push(lq, [(toolnet.one(), toolnet.RG)])
+    push(lk, [(pos, 1)])
+    push(lq, [(toolnet.one(), toolnet.MBOS)])
+    push(lk, [(pos_feat(g, "bos"), 1)])
+    if compact == false {
+        let fd = toolnet.head(g, "link", lq, lk, [pos, w_lin(c, keyany, 0), Pfx, r_ins, Ltot, vstart, bsrc], [])
+        let fol_ok = andb(c, [fv, fd[1], gt_w(c, fd[0], h), gt_w(c, h, d)], [])     # (the href is read on its tape)
+        let fol_err = andb(c, [fv], [fol_ok])
+        toolnet.emit(ot, fol_ok, flo)
+        toolnet.emit(ot, fol_err, flo + 50)
+        push(cases, ("fol_ok", fol_ok))
+        push(cases, ("fol_err", fol_err))
+        let lf = latest(g, "last_fol", fol_ok, [pos, fol_ok, fd[2], fd[3], fd[4], fd[5], fd[6]])
+        fol_out = andb(c, [ph_fetch, lf[1], eqb(c, sub(c, lmp, lf[0]), 1)], [])
+        let ft = w_lin(c, [(pos, 1), (lf[0], -1)], -1)
+        let fend = url_chars(x, ot, cases, fol_out, ft, [lf[2], lf[3], lf[4], lf[5], lf[6]], byw, "fol")
+        toolnet.emit(ot, fend, flo + 1)
+        push(cases, ("fol_end", fend))
+    } else {
+        # ---- page compaction (docs/tfs_fetch_compact.md): after a body's <|fetch_done|> the net forces
+        #   <|pc_url|> URL <|pc_links|> (<|ln_k|> URL_k)* <|pc_text|> TEXT <|pc_end|>
+        # URL: the page's URL (its fragment dropped); URL_k: link k resolved (the follow's rule, from the raw bytes,
+        # once); TEXT: the page's text tokens in order (TEXT bytes, words, links, headings), copied by rank: every
+        # body text token q carries rank(q), the number of text tokens of its page before it, computed by binary
+        # lifting over the predecessor pointer (no counting: 1 + 13 + 14 abs heads); the copy at index j reads the
+        # token of rank j on the page whose <|h_hend|> is h. After <|pc_end|> nothing reads the raw region again.
+        let ph_pcu = eqm(x, mk, K_PCU)
+        let ph_pcl = eqm(x, mk, K_PCL)
+        let ph_pct = eqm(x, mk, K_PCT)
+        let ci = sub(c, pos, lmp)                    # the offset in the block's current part
+        let pbody = w_lin(c, [(eqm(x, pm[0], K_HEND), 1), (eqm(x, pm[0], K_CHUNK), 1), (eqm(x, pm[0], K_NEXT), 1)], 0)
+        let c_pcu = andb(c, [cur_mark, eqm(x, mk, K_DONE), pbody], [])
+        toolnet.emit(ot, c_pcu, lo3 + I_PCU)
+        push(cases, ("pc_url", c_pcu))
+        # the page's URL: the latest request's URL source (the call, or the Location), b_L characters
+        let in_u = andb(c, [ph_pcu, gt_w(c, b_L, ci)], [])
+        let urd = read_at(g, "pcu_rd", gate_by(c, w_lin(c, [(bsrc, 1), (ci, 1)], 1), in_u), [byw])[0]
+        for i in 0..len(UCH) {
+            let bit = andb(c, [in_u, eqm(x, urd, UCH[i])], [])
+            toolnet.emit(ot, bit, tid(x, UCH[i]))
+            push(cases, ("pcu_c", bit))
+        }
+        let u_end = andb(c, [ph_pcu, eqb(c, sub(c, ci, b_L), 0)], [])
+        toolnet.emit(ot, u_end, lo3 + I_PCL)
+        push(cases, ("pcu_end", u_end))
+        # the link table: <|ln_k|> then link k's URL, for k = 1 .. count (the page's links)
+        let tln = latest(g, "last_tln", andb(c, [tok_feat(g, "ISLN"), ph_pcl], []), [pos, tok_feat(g, "LNV")])
+        let ine = andb(c, [ph_pcl, gt_w(c, tln[0], lmp)], [])
+        let kt = gate_by(c, tln[1], ine)
+        let tq: list[list[(int, int)]] = []
+        for kk in 1..K + 1 { push(tq, [(eqm(x, kt, kk), toolnet.MFLAG)]) }
+        push(tq, [(toolnet.one(), toolnet.RG)])
+        push(tq, [(toolnet.one(), toolnet.MBOS)])
+        let tl = toolnet.head(g, "tlink", tq, lk, [Pfx, r_ins, Ltot, vstart, bsrc], [])
+        let tft = sub(c, pos, tln[0])
+        let t_end = url_chars(x, ot, cases, ine, tft, tl, byw, "tab")
+        let t0 = andb(c, [ph_pcl, eqb(c, ci, 0)], [])            # at <|pc_links|>: the first link, or none
+        let t_first = andb(c, [t0, geb(c, count, 1)], [])
+        toolnet.emit(ot, t_first, lo3 + I_LN)
+        push(cases, ("tab_first", t_first))
+        let more_l = gt_w(c, count, kt)
+        for kk in 1..K {
+            let bit = andb(c, [t_end, more_l, eqm(x, kt, kk)], [])
+            toolnet.emit(ot, bit, lo3 + I_LN + kk)
+            push(cases, ("tab_next", bit))
+        }
+        let t_done = w_lin(c, [(andb(c, [t0], [geb(c, count, 1)]), 1), (andb(c, [t_end], [more_l]), 1)], 0)
+        toolnet.emit(ot, t_done, lo3 + I_PCT)
+        push(cases, ("tab_done", t_done))
+        # the text: rank by binary lifting. P0(q) = the latest text token before q on this page, else h; P_{k+1} =
+        # P_k(P_k(q)) read at P_k(q) (its digits carried with it); rank(q) = the most steps from q that stay after h
+        let isT = andb(c, [tok_feat(g, "TEXTISH"), ph_body_raw], [])
+        let lt1 = abs_head(g, "prev_text", pa, pb, pc, [(pss, 1)], [ltx[0]])[0]
+        let P0 = w_lin(c, [(h, 1), (gate_by(c, sub(c, lt1, h), gt_w(c, lt1, h)), 1)], 0)
+        let (d0a, d0b, d0c, d0s) = digits(c, P0)
+        let Ps: list[int] = [P0]
+        let Da: list[int] = [d0a]
+        let Db: list[int] = [d0b]
+        let Dc: list[int] = [d0c]
+        let Dq: list[int] = [sumw(c, [d0s[0].0, d0s[1].0, d0s[2].0])]
+        for kk in 0..NLIFT - 1 {
+            let r = abs_head(g, format("lift{}", kk), Da[kk], Db[kk], Dc[kk], [(Dq[kk], 1)],
+                [Ps[kk], Da[kk], Db[kk], Dc[kk], Dq[kk]])
+            push(Ps, r[0])
+            push(Da, r[1])
+            push(Db, r[2])
+            push(Dc, r[3])
+            push(Dq, r[4])
+        }
+        let (ca0, cb0, cc0, cs0) = toolnet.off_digits(g, 0)
+        let ca = ca0
+        let cb = cb0
+        let cc = cc0
+        let cs = cs0
+        let rt: list[(int, int)] = []
+        let pw = 1
+        for _ in 0..NLIFT - 1 { pw = pw * 2 }
+        for i in 0..NLIFT {
+            let kk = NLIFT - 1 - i
+            let r = abs_head(g, format("rank{}", kk), ca, cb, cc, [(cs, 1)], [Ps[kk], Da[kk], Db[kk], Dc[kk], Dq[kk]])
+            let bit = gt_w(c, r[0], h)
+            push(rt, (bit, pw))
+            ca = w_lin(c, [(ca, 1), (gate_by(c, sub(c, r[1], ca), bit), 1)], 0)
+            cb = w_lin(c, [(cb, 1), (gate_by(c, sub(c, r[2], cb), bit), 1)], 0)
+            cc = w_lin(c, [(cc, 1), (gate_by(c, sub(c, r[3], cc), bit), 1)], 0)
+            cs = w_lin(c, [(cs, 1), (gate_by(c, sub(c, r[4], cs), bit), 1)], 0)
+            pw = pw / 2
+        }
+        let rank = w_lin(c, rt, 0)
+        let lrk = latest(g, "last_trank", isT, [pos, rank])
+        let m = gate_by(c, addk(c, lrk[1], 1), gt_w(c, lrk[0], h))     # the page's text tokens
+        let in_t = andb(c, [ph_pct, gt_w(c, m, ci)], [])
+        let t_fin = andb(c, [ph_pct, eqb(c, sub(c, ci, m), 0)], [])
+        toolnet.emit(ot, t_fin, lo3 + I_PCE)
+        push(cases, ("pct_end", t_fin))
+        # the copy: the key of rank j on the page of h (both matched digit by digit, as an abs head matches a position)
+        let (ja, jb, jc, jsq) = digits(c, gate_by(c, ci, ph_pct))
+        let (ha, hb, hc, hsq) = digits(c, h)
+        let (ra, rb2, rc, rsq) = digits(c, rank)
+        let cq: list[list[(int, int)]] = [[(toolnet.one(), toolnet.MFLAG)]]
+        let ck: list[list[(int, int)]] = [[(isT, 1)]]
+        let qd = [ja, jb, jc, ha, hb, hc]
+        let kd = [ra, rb2, rc, ha, hb, hc]
+        let ksq = [rsq[0].0, rsq[1].0, rsq[2].0, hsq[0].0, hsq[1].0, hsq[2].0]
+        for i in 0..6 {
+            push(cq, [(qd[i], 2 * toolnet.CPOS)])
+            push(ck, [(kd[i], 1)])
+            push(cq, [(toolnet.one(), 0 - toolnet.CPOS)])
+            push(ck, [(ksq[i], 1)])
+        }
+        let qs: list[(int, int)] = []
+        for t2 in concat(jsq, hsq) { push(qs, (t2.0, 0 - toolnet.CPOS * t2.1)) }
+        push(cq, qs)
+        push(ck, [(toolnet.one(), 1)])
+        let cvs: list[int] = []
+        for b in 0..nb { push(cvs, tok_feat(g, format("code{}", b))) }
+        let cv = toolnet.head(g, "ctext", cq, ck, cvs, [])
+        for b in 0..nb { push(ot[b], (gate_by(c, cv[b], in_t), 1)) }
+        push(cases, ("pct_copy", in_t))
+        # the follow: link k of the current page's table (its <|ln_k|> after the latest <|h_hend|>), its URL copied
+        let fq: list[list[(int, int)]] = []
+        let fk: list[list[(int, int)]] = []
+        let fany: list[(int, int)] = []
+        for kk in 1..K + 1 {
+            let kw = andb(c, [tok_feat(g, format("LN{}", kk)), ph_pcl], [])
+            push(fq, [(tok_feat(g, format("LN{}", kk)), toolnet.MFLAG)])
+            push(fk, [(kw, 1)])
+            push(fany, (kw, 1))
+        }
+        push(fq, [(toolnet.one(), toolnet.RG)])
+        push(fk, [(pos, 1)])
+        push(fq, [(toolnet.one(), toolnet.MBOS)])
+        push(fk, [(pos_feat(g, "bos"), 1)])
+        let fd = toolnet.head(g, "link", fq, fk, [pos, w_lin(c, fany, 0), tl[2]], [])
+        let fol_ok = andb(c, [fv, fd[1], gt_w(c, fd[0], h)], [])
+        let fol_err = andb(c, [fv], [fol_ok])
+        toolnet.emit(ot, fol_ok, flo)
+        toolnet.emit(ot, fol_err, flo + 50)
+        push(cases, ("fol_ok", fol_ok))
+        push(cases, ("fol_err", fol_err))
+        let lf = latest(g, "last_fol", fol_ok, [pos, fol_ok, fd[0], fd[2]])
+        fol_out = andb(c, [ph_fetch, lf[1], eqb(c, sub(c, lmp, lf[0]), 1)], [])
+        let ft = w_lin(c, [(pos, 1), (lf[0], -1)], -1)
+        let f_in = andb(c, [fol_out, gt_w(c, lf[3], ft)], [])
+        let frd = read_at(g, "fol_rd", gate_by(c, w_lin(c, [(lf[2], 1), (ft, 1)], 1), f_in), [byw])[0]
+        for i in 0..len(UCH) {
+            let bit = andb(c, [f_in, eqm(x, frd, UCH[i])], [])
+            toolnet.emit(ot, bit, tid(x, UCH[i]))
+            push(cases, ("fol_c", bit))
+        }
+        let fend = andb(c, [fol_out, eqb(c, sub(c, ft, lf[3]), 0)], [])
+        toolnet.emit(ot, fend, flo + 1)
+        push(cases, ("fol_end", fend))
+        for sn in [("ph_pcu", ph_pcu), ("ph_pcl", ph_pcl), ("ph_pct", ph_pct), ("c_pcu", c_pcu), ("in_u", in_u),
+            ("ine", ine), ("kt", kt), ("tft", tft), ("m", m), ("rank", rank), ("in_t", in_t), ("isT", isT),
+            ("fol_ok", fol_ok), ("P0", P0), ("t_end", t_end)] {
+            toolnet.name(g, sn.0, sn.1)
+        }
+    }
+
+    # ---- paging: <|h_more|> then the byte offset's three base-32 digits, then <|fetch_cut|>; <|next|> resumes
+    let tm = sub(c, pos, lmp)
+    let (ba, bb, bc, bsq) = digits(c, gate_by(c, w_lin(c, [(lmp, 1), (D, -1)], -1), ph_more))
+    let dg = [ba, bb, bc]
+    for j in 0..3 {
+        let at = andb(c, [ph_more, eqb(c, tm, j)], [])
+        for v in 0..NPG {
+            let bit = andb(c, [at, eqm(x, dg[j], v)], [])
+            toolnet.emit(ot, bit, lo3 + I_PG + v)
+            push(cases, ("pg", bit))
+        }
+    }
+    push(cuts, (andb(c, [ph_more, eqb(c, tm, 3)], []), 1))
+    toolnet.emit(ot, nxt_bad, flo + 50)
+    push(cases, ("next_err", nxt_bad))
+
+    # ---- the cases' sums
+    let c_skip = w_lin(c, skips, 0)
+    let c_fail = w_lin(c, fails, 0)
+    let c_cut = w_lin(c, cuts, 0)
+    let c_done = w_lin(c, dones, 0)
+    toolnet.emit(ot, c_skip, lo + NEXTRA + 4)
+    toolnet.emit(ot, c_hend, lo + NEXTRA + 5)
+    toolnet.emit(ot, c_fail, flo + 52)
+    toolnet.emit(ot, c_cut, flo + 53)
+    toolnet.emit(ot, c_done, flo + 49)
+    let named = [("c_err", c_err), ("c_deny", c_deny), ("c_tcp", c_tcp), ("c_tls", c_tls), ("c_req", at_req),
+        ("c_send", at_send), ("c_skip", c_skip), ("c_hend", c_hend), ("c_chunk", r_lf), ("c_fail", c_fail),
+        ("c_cut", c_cut), ("c_done", c_done), ("c_redir1", rds[0]), ("c_redir2", rds[1]), ("c_redir3", rds[2])]
+    let fts: list[(int, int)] = []
+    for cs in named {
+        toolnet.name(g, cs.0, cs.1)
+        push(fts, (cs.1, 1))
+    }
+    for cs in cases { push(fts, (cs.1, 1)) }
+    let fire = w_lin(c, fts, 0)
+    toolnet.name(g, "fire", fire)
+    let out: list[int] = []
+    for b in 0..nb { push(out, w_lin(c, ot[b], 0)) }
+    let notfire = kr(c, nb, [(fire, -1)], 1)
+    for sn in [("d", d), ("D", D), ("h", h), ("mk", mk), ("L", L), ("Le", Le), ("valid_call", valid_call), ("valid_loc", valid_loc),
+        ("allowed", allowed), ("he", he), ("hasport", hasport), ("t", t), ("idx", idx), ("x0", x0), ("rb", rb),
+        ("cl", cl), ("chunked", chunked), ("is_len", is_len), ("is_eof", is_eof), ("cont", cont), ("S", S),
+        ("csize", csize), ("ce_name", ce_name), ("ce_bad", ce_bad), ("ce_ref", ce_ref),
+        ("k", k), ("n", n), ("reg", reg), ("u", u), ("nred", nred), ("count", count),
+        ("linkable", linkable), ("Lh", Lh), ("Pfx", Pfx), ("Ltot", Ltot), ("fol_out", fol_out), ("fv", fv),
+        ("valid_next", valid_next), ("ph_body", ph_body), ("ph_more", ph_more), ("vpos", vpos), ("segs", segs),
+        ("b_L", b_L), ("b_he", b_he), ("b_hasp", b_hasp), ("b_lsl1", b_lsl1), ("anyword", anyword)] {
+        toolnet.name(g, sn.0, sn.1)
+    }
+    let s3 = S3
+    if compact { s3 = S3 + 4 }
+    return toolnet.built(g, "fetch3", nb, lo3, s3, out, fire, notfire)
+}
+
+# ---- the mask part --------------------------------------------------------------------------------------------
+# classes (tfs/fetch3.py classes): 0 every other token, 1..K the links, K+1..K+73 the URL characters (UCH), K+74
+# <|fetch_end|>, K+75 <|follow|>, K+76 <|fetch|>.
+type MOut = { bt: toolnet.Built, deny: list[int], active: int }
+
+fn build_mask(lo3: int, flo: int, V: int, starts: list[str], compact: logic) -> MOut {
+    let nb = toolnet.bitlen_of(V - 1)
+    let maxl = 1
+    for s in starts {
+        assert(len(s) <= UMAX, "fetch3_net: a start point longer than 64 characters")
+        for ch in s { assert(cidx(UCH, ch) >= 0, "fetch3_net: a start point character outside UCH") }
+        maxl = max(maxl, len(s))
+    }
+    let offs: list[int] = []
+    for k in 1..maxl { push(offs, -k) }
+    let g = toolnet.new_graph(nb, flags(), offs)
+    let c = g.c
+    let x = Ctx { g: g, c: c, memo: map_new(), lo: 0, flo: flo, lo3: lo3, xb: extra_bytes() }
+    let pos = pos_feat(g, "pos")
+    let lm = latest(g, "last_mark", tok_feat(g, "MARK"), [tok_feat(g, "MK"), pos])
+    let mk = lm[0]
+    let deny: list[int] = []
+    let active = w_lin(c, [], 0)
+    let ncls = K + len(UCH) + 4
+    if len(starts) == 0 {
+        for _ in 0..ncls { push(deny, w_lin(c, [], 0)) }
+    } else {
+        let h = latest(g, "last_hend", tok_feat(g, "F_HEND"), [pos])[0]
+        let pbr = w_lin(c, [(eqm(x, mk, K_HEND), 1), (eqm(x, mk, K_CHUNK), 1), (eqm(x, mk, K_NEXT), 1)], 0)
+        if compact { pbr = eqm(x, mk, K_PCL) }       # compaction: the links of the current page's table
+        let lln = latest(g, "last_ln", andb(c, [tok_feat(g, "ISLN"), pbr], []), [pos, tok_feat(g, "LNV")])
+        let n = gate_by(c, lln[1], gt_w(c, lln[0], h))
+        let in_call = eqm(x, mk, K_FETCH)
+        let in_fol = tok_feat(g, "F_FOL")
+        let m = sub(c, pos, lm[1])
+        let chs: list[int] = [tok_feat(g, "CHI")]          # the URL character (index + 1) at pos - k
+        for k in 1..maxl {
+            let (a, b, cc, ss) = toolnet.off_digits(g, -k)
+            push(chs, abs_head(g, format("back{}", k), a, b, cc, [(ss, 1)], [tok_feat(g, "CHI")])[0])
+        }
+        let allow_c: list[list[int]] = []
+        for _ in 0..len(UCH) { push(allow_c, []) }
+        let allow_end: list[int] = []
+        for s in starts {
+            for mm in 0..len(s) + 1 {
+                let ps: list[int] = [in_call, eqb(c, m, mm)]
+                for j in 0..mm { push(ps, eqm(x, chs[mm - 1 - j], cidx(UCH, s[j]) + 1)) }
+                let bit = andb(c, ps, [])
+                if mm < len(s) {
+                    push(allow_c[cidx(UCH, s[mm])], bit)
+                } else {
+                    push(allow_end, bit)
+                }
+            }
+        }
+        let both = w_lin(c, [(in_call, 1), (in_fol, 1)], 0)
+        push(deny, both)                                                   # every other token
+        for kk in 1..K + 1 { push(deny, w_lin(c, [(in_call, 1), (andb(c, [in_fol, leb(c, n, kk - 1)], []), 1)], 0)) }
+        for i in 0..len(UCH) {
+            let okc = w_lin(c, [], 0)
+            if len(allow_c[i]) > 0 { okc = orn(c, allow_c[i]) }
+            push(deny, w_lin(c, [(andb(c, [in_call], [okc]), 1), (in_fol, 1)], 0))
+        }
+        let oke = w_lin(c, [], 0)
+        if len(allow_end) > 0 { oke = orn(c, allow_end) }
+        push(deny, w_lin(c, [(andb(c, [in_call], [oke]), 1), (in_fol, 1)], 0))       # <|fetch_end|>
+        push(deny, orn(c, [in_call, in_fol, eqb(c, n, 0)]))                           # <|follow|>
+        push(deny, both)                                                              # <|fetch|>
+        active = both
+        toolnet.name(g, "n", n)
+        toolnet.name(g, "in_call", in_call)
+    }
+    toolnet.name(g, "active", active)
+    let fire = w_lin(c, [], 0)
+    let out: list[int] = []
+    for b in 0..nb { push(out, w_lin(c, [], 0)) }
+    let notfire = kr(c, nb, [(fire, -1)], 1)
+    toolnet.name(g, "fire", fire)
+    return MOut { bt: toolnet.built(g, "fetch3_mask", nb, lo3, 0, out, fire, notfire), deny: deny, active: active }
+}
+
+# ---- why the net is silent (proved when this file loads) -------------------------------------------------------
+# Every case bit is andb(pos, neg) = relu(sum pos - sum neg - n + 1) over 0/1 bits with a phase bit among pos: v2's
+# (cur_end, cur_hend, ph_req / ph_redir / ph_head / ph_body), and v3's: fv ([the token before is <|follow|>]),
+# fol_out ([the latest marker is a follow's forced <|fetch|>]), ph_more ([the latest marker is <|h_more|>]),
+# cur_next ([the token is <|next|>]); the body's cases are ANDs with cont, an AND with ph_body. Where no phase bit
+# holds, sum pos <= n - 1 and every case bit is 0 (`and_off`); [mk == v] is exactly 0 or 1 for an integer mk
+# (`eq_bit`); the output code and fire are sums of case bits times constants: exactly 0, and notfire = nb
+# (`not_fired`). The mask part never fires; its deny bits for every class but <|follow|> are ANDs (or sums of
+# ANDs) with in_call or in_follow, so outside a call and right after <|follow|> it denies only <|follow|>.
+fn relu(x) {
+    if x > 0 { return x }
+    return 0
+}
+fn eq_ref(d, v) {
+    if d == v { return 1 }
+    return 0
+}
+theorem and_off(s, z, n) {
+    requires 1 <= n & n <= 100
+    requires 0 <= s & s <= n - 1
+    requires 0 <= z & z <= 100
+    ensures relu(s - z - n + 1) == 0
+}
+theorem eq_bit(d, v) {
+    requires -1000000 <= d & d <= 1000000
+    requires -1000000 <= v & v <= 1000000
+    ensures relu(d - v + 1) - relu(d - v) + relu(v - d + 1) - relu(v - d) - 1 == eq_ref(d, v)
+}
+theorem not_fired(nb) {
+    requires 1 <= nb & nb <= 64
+    ensures nb * relu(0 - 0 + 1) == nb
+}
+
+let argv = args()
+let lo30 = 611
+let lo0 = 549
+let flo0 = 495
+let vv = 692
+let allow: list[str] = []
+let words: list[Word] = []
+let part = "force"
+let starts: list[str] = []
+let page = 1024
+let compact = false
+let agent = "tern-fetch/0.1 (+https://ternary.dev)"
+if len(argv) > 8 {
+    lo30 = unwrap(try_parse_int(argv[0]))
+    lo0 = unwrap(try_parse_int(argv[1]))
+    flo0 = unwrap(try_parse_int(argv[2]))
+    vv = unwrap(try_parse_int(argv[3]))
+    if argv[4] != "-" { allow = split(argv[4], ",") }
+    if argv[5] != "-" { words = parse_words(read_file(argv[5])) }
+    part = argv[6]
+    if argv[7] != "-" { starts = split(argv[7], ",") }
+    let pg = argv[8]
+    if len(pg) > 1 & pg[len(pg) - 1] == 99 {        # "1024c": with page compaction
+        compact = true
+        pg = substr(pg, 0, len(pg) - 1)
+    }
+    page = unwrap(try_parse_int(pg))
+}
+if len(argv) > 9 { agent = argv[9] }
+assert(part == "force" | part == "mask", "fetch3_net: PART is force or mask")
+if part == "force" {
+    let bt = build(lo30, lo0, flo0, vv, allow, words, (page, compact), agent)
+    print(toolnet.summary(bt), format("({} allowed origins, {} words, page {}, compact {})", len(allow), len(words),
+        page, compact))
+    if len(argv) > 10 {
+        toolnet.export(bt, argv[10])
+        print("exported to", argv[10])
+    }
+} else {
+    let mo = build_mask(lo30, flo0, vv, starts, compact)
+    print(toolnet.summary(mo.bt), format("({} start points)", len(starts)))
+    if len(argv) > 10 {
+        toolnet.export(mo.bt, argv[10])
+        let mw: list[int] = []
+        for w in mo.deny { push(mw, w) }
+        push(mw, mo.active)
+        save_ints(argv[10] + "/mask_w.npy", mw)
+        print("exported to", argv[10])
+    }
+}
